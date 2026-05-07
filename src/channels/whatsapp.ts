@@ -106,11 +106,14 @@ export class WhatsAppChannel implements Channel {
 
   async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      this.connectInternal(resolve).catch(reject);
+      this.connectInternal(resolve, reject).catch(reject);
     });
   }
 
-  private async connectInternal(onFirstOpen?: () => void): Promise<void> {
+  private async connectInternal(
+    onFirstOpen?: () => void,
+    onFail?: (err: Error) => void,
+  ): Promise<void> {
     const authDir = path.join(STORE_DIR, 'auth');
     fs.mkdirSync(authDir, { recursive: true });
 
@@ -140,7 +143,10 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        if (onFail) {
+          onFail(new Error(msg));
+        }
+        // Do not exit — other channels (e.g. Discord) should keep running
       }
 
       if (connection === 'close') {
@@ -170,7 +176,7 @@ export class WhatsAppChannel implements Channel {
           });
         } else {
           logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          // Do not exit — other channels should keep running
         }
       } else if (connection === 'open') {
         this.connected = true;

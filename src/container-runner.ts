@@ -64,6 +64,16 @@ function buildVolumeMounts(
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 
+  // NanoClaw application logs (read-only for all groups)
+  const logsDir = path.join(projectRoot, 'logs');
+  if (fs.existsSync(logsDir)) {
+    mounts.push({
+      hostPath: logsDir,
+      containerPath: '/workspace/logs',
+      readonly: true,
+    });
+  }
+
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
     // (group folder, IPC, .claude/) are mounted separately below.
@@ -373,6 +383,12 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
+    container.stdin.on('error', (err) => {
+      logger.warn(
+        { group: group.name, containerName, err },
+        'Container stdin error (container may have exited early)',
+      );
+    });
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
 
@@ -515,13 +531,21 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
+          outputChain
+            .then(() => {
+              resolve({
+                status: 'success',
+                result: null,
+                newSessionId,
+              });
+            })
+            .catch((err) => {
+              logger.error(
+                { group: group.name, containerName, err },
+                'Output chain error after timeout — releasing queue lock',
+              );
+              resolve({ status: 'error', result: null, error: String(err) });
             });
-          });
           return;
         }
 
@@ -619,17 +643,25 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
-          );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
+        outputChain
+          .then(() => {
+            logger.info(
+              { group: group.name, duration, newSessionId },
+              'Container completed (streaming mode)',
+            );
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
+          })
+          .catch((err) => {
+            logger.error(
+              { group: group.name, containerName, err },
+              'Output chain error — releasing queue lock',
+            );
+            resolve({ status: 'error', result: null, error: String(err) });
           });
-        });
         return;
       }
 

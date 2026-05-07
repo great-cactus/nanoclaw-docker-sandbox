@@ -37,3 +37,7 @@ groups/global/*
 
 agents-sdk-docs
 nanoclaw.pid
+openclaw.tar.gz
+nanoclaw.db
+.claude/settings.local.json
+.git.corrupted-backup/

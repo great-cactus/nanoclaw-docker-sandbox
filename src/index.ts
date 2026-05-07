@@ -1,3 +1,4 @@
+import './ws-proxy-patch.js'; // Must be first — patches ws before discord.js captures it
 import fs from 'fs';
 import path from 'path';
 
@@ -388,21 +389,8 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
-          }
+          // requiresTrigger is stored as INTEGER (0/1) in SQLite — coerce to boolean
+          const needsTrigger = !isMainGroup && !!group.requiresTrigger;
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
@@ -415,6 +403,8 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
+          // If a container is already active for this group, pipe the message
+          // directly regardless of trigger — the conversation is already open.
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
@@ -430,7 +420,17 @@ async function startMessageLoop(): Promise<void> {
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
           } else {
-            // No active container — enqueue for a new one
+            // No active container — check trigger before launching a new one
+            if (needsTrigger) {
+              const allowlistCfg = loadSenderAllowlist();
+              const hasTrigger = groupMessages.some(
+                (m) =>
+                  TRIGGER_PATTERN.test(m.content.trim()) &&
+                  (m.is_from_me ||
+                    isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+              );
+              if (!hasTrigger) continue;
+            }
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -460,13 +460,13 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
+async function ensureContainerSystemRunning(): Promise<void> {
+  await ensureContainerRuntimeRunning();
   cleanupOrphans();
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  await ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -487,6 +487,16 @@ async function main(): Promise<void> {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('uncaughtException', (err) => {
+    // Write synchronously to stderr so it lands in nanoclaw.error.log even if pino doesn't flush
+    process.stderr.write(`[UNCAUGHT EXCEPTION] ${err?.stack || err}\n`);
+    logger.error({ err }, 'Uncaught exception — process will exit');
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    process.stderr.write(`[UNHANDLED REJECTION] ${reason}\n`);
+    logger.error({ reason }, 'Unhandled promise rejection');
+  });
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
@@ -517,6 +527,7 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    registerGroup,
   };
 
   // Create and connect all registered channels.
@@ -532,8 +543,15 @@ async function main(): Promise<void> {
       );
       continue;
     }
-    channels.push(channel);
-    await channel.connect();
+    try {
+      await channel.connect();
+      channels.push(channel);
+    } catch (err) {
+      logger.warn(
+        { channel: channelName, err },
+        'Channel failed to connect — skipping. Other channels will continue.',
+      );
+    }
   }
   if (channels.length === 0) {
     logger.fatal('No channels connected');

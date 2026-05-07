@@ -2,12 +2,14 @@
 // Each import triggers the channel module's registerChannel() call.
 
 // discord
+import './discord.js';
 
 // gmail
 
 // slack
 
 // telegram
+import './telegram.js';
 
 // whatsapp
-import './whatsapp.js';
+// import './whatsapp.js';
