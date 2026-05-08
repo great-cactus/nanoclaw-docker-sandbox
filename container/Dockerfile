@@ -30,7 +30,13 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-populate known_hosts for common Git hosts so first-time SSH does not prompt.
+RUN mkdir -p /etc/ssh && \
+    ssh-keyscan -t rsa,ecdsa,ed25519 github.com gitlab.com bitbucket.org \
+        >> /etc/ssh/ssh_known_hosts 2>/dev/null || true
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -64,17 +70,22 @@ RUN npm run build
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
-# Create entrypoint script
 # Container input (prompt, group info) is passed via stdin JSON.
 # Credentials are injected by the host's credential proxy — never passed here.
 # Follow-up messages arrive via IPC files in /workspace/ipc/input/
-RUN printf '#!/bin/bash\nset -e\nrm -rf /tmp/dist\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\nln -s /app/node_modules /tmp/dist/node_modules\nchmod -R a-w /tmp/dist\ncat > /tmp/input.json\nnode /tmp/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+# Apple Container only supports directory mounts (VirtioFS), so .env cannot be
+# shadowed with a host-side /dev/null file mount. Instead the entrypoint starts
+# as root, uses mount --bind to shadow .env, then drops to the host user via setpriv.
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace && chmod 777 /home/node
 
-# Switch to non-root user (required for --dangerously-skip-permissions)
-USER node
+# Note: do NOT set `USER node` here. Main-group containers run as root so the
+# entrypoint can `mount --bind /dev/null /workspace/project/.env` to shadow
+# secrets, then drop privileges via setpriv. Non-main containers receive
+# `--user $UID:$GID` from the host.
 
 # Set working directory to group workspace
 WORKDIR /workspace/group
