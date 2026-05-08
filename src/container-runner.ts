@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -21,6 +21,7 @@ import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  containerRunSpawn,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
@@ -41,6 +42,7 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  script?: string;
 }
 
 export interface ContainerOutput {
@@ -86,22 +88,8 @@ function buildVolumeMounts(
       readonly: true,
     });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the credential proxy, never exposed to containers.
-    // Use an empty file instead of /dev/null (Docker may reject /dev/null mounts in sandboxes).
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      const emptyEnv = path.join(DATA_DIR, 'empty-env');
-      if (!fs.existsSync(emptyEnv)) {
-        fs.mkdirSync(path.dirname(emptyEnv), { recursive: true });
-        fs.writeFileSync(emptyEnv, '');
-      }
-      mounts.push({
-        hostPath: emptyEnv,
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
+    // .env shadowing is handled inside the container entrypoint via mount --bind
+    // (Apple Container only supports directory mounts, not file mounts like /dev/null)
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -206,8 +194,17 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
+    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    const needsCopy =
+      !fs.existsSync(groupAgentRunnerDir) ||
+      !fs.existsSync(cachedIndex) ||
+      (fs.existsSync(srcIndex) &&
+        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+    if (needsCopy) {
+      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
@@ -231,8 +228,9 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  isMain: boolean,
 ): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const args: string[] = ['run', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -256,12 +254,12 @@ function buildContainerArgs(
       if (caCertEnvVars.includes(envVar)) {
         args.push('-e', `${envVar}=/workspace/ca-cert/proxy-ca.crt`);
       } else if (envVar === 'NO_PROXY' || envVar === 'no_proxy') {
-        // Add host.docker.internal to NO_PROXY so the credential proxy
+        // Add the host gateway to NO_PROXY so the credential proxy
         // (ANTHROPIC_BASE_URL) isn't routed through the HTTPS proxy
         const val = process.env[envVar];
         const extra = val
-          ? `${val},host.docker.internal`
-          : 'host.docker.internal';
+          ? `${val},${CONTAINER_HOST_GATEWAY}`
+          : CONTAINER_HOST_GATEWAY;
         args.push('-e', `${envVar}=${extra}`);
       } else {
         args.push('-e', `${envVar}=${process.env[envVar]}`);
@@ -312,7 +310,14 @@ function buildContainerArgs(
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+    if (isMain) {
+      // Main containers start as root so the entrypoint can mount --bind
+      // to shadow .env. Privileges are dropped via setpriv in entrypoint.sh.
+      args.push('-e', `RUN_UID=${hostUid}`);
+      args.push('-e', `RUN_GID=${hostGid}`);
+    } else {
+      args.push('--user', `${hostUid}:${hostGid}`);
+    }
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -343,7 +348,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
 
   logger.debug(
     {
@@ -371,9 +376,17 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  // Write input to a file in the IPC directory so the container can read it
+  // without needing stdin piping (Apple Container crashes with SIGTRAP when
+  // spawned from Node.js with piped stdio and -i flag).
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const inputFile = path.join(groupIpcDir, 'input', 'prompt.json');
+  fs.writeFileSync(inputFile, JSON.stringify(input));
+
   return new Promise((resolve) => {
-    const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const { cmd: spawnCmd, args: spawnArgs } = containerRunSpawn(containerArgs);
+    const container = spawn(spawnCmd, spawnArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     onProcess(container, containerName);
@@ -382,15 +395,6 @@ export async function runContainerAgent(
     let stderr = '';
     let stdoutTruncated = false;
     let stderrTruncated = false;
-
-    container.stdin.on('error', (err) => {
-      logger.warn(
-        { group: group.name, containerName, err },
-        'Container stdin error (container may have exited early)',
-      );
-    });
-    container.stdin.write(JSON.stringify(input));
-    container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
@@ -484,15 +488,18 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
+      try {
+        stopContainer(containerName);
+      } catch (err) {
+        logger.warn(
+          { group: group.name, containerName, err },
+          'Graceful stop failed',
+        );
+      }
+      // Always kill the spawned process to ensure the close event fires.
+      // Apple Container's `container stop` stops the VM but does not cause
+      // the `container run` client process to exit on its own.
+      container.kill('SIGKILL');
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
@@ -582,10 +589,20 @@ export async function runContainerAgent(
       const isError = code !== 0;
 
       if (isVerbose || isError) {
+        // On error, log input metadata only — not the full prompt.
+        // Full input is only included at verbose level to avoid
+        // persisting user conversation content on every non-zero exit.
+        if (isVerbose) {
+          logLines.push(`=== Input ===`, JSON.stringify(input, null, 2), ``);
+        } else {
+          logLines.push(
+            `=== Input Summary ===`,
+            `Prompt length: ${input.prompt.length} chars`,
+            `Session ID: ${input.sessionId || 'new'}`,
+            ``,
+          );
+        }
         logLines.push(
-          `=== Input ===`,
-          JSON.stringify(input, null, 2),
-          ``,
           `=== Container Args ===`,
           containerArgs.join(' '),
           ``,
@@ -736,6 +753,7 @@ export function writeTasksSnapshot(
     id: string;
     groupFolder: string;
     prompt: string;
+    script?: string | null;
     schedule_type: string;
     schedule_value: string;
     status: string;

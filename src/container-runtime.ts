@@ -3,49 +3,60 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
-import fs from 'fs';
 import os from 'os';
 
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'docker';
+export const CONTAINER_RUNTIME_BIN = 'container';
 
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+/**
+ * Returns the spawn command and args for `container run`.
+ * Apple Container's CLI crashes with SIGTRAP when spawned from Node.js without
+ * a controlling terminal (stdout is a pipe). We wrap with `script -q /dev/null`
+ * to allocate a PTY so the CLI behaves as if it has a terminal.
+ */
+export function containerRunSpawn(runArgs: string[]): {
+  cmd: string;
+  args: string[];
+} {
+  return {
+    cmd: 'script',
+    args: ['-q', '/dev/null', CONTAINER_RUNTIME_BIN, ...runArgs],
+  };
+}
+
+/**
+ * IP address containers use to reach the host machine.
+ * Apple Container VMs use a bridge network (192.168.64.x); the host is at the gateway.
+ * Detected from the bridge0 interface, falling back to 192.168.64.1.
+ */
+export const CONTAINER_HOST_GATEWAY = detectHostGateway();
+
+function detectHostGateway(): string {
+  // Apple Container on macOS: containers reach the host via the bridge network gateway
+  const ifaces = os.networkInterfaces();
+  const bridge = ifaces['bridge100'] || ifaces['bridge0'];
+  if (bridge) {
+    const ipv4 = bridge.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+  // Fallback: Apple Container's default gateway
+  return '192.168.64.1';
+}
 
 /**
  * Address the credential proxy binds to.
- * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
- * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
- *   falling back to 0.0.0.0 if the interface isn't found.
+ * Apple Container's bridge100 interface only exists while containers are running,
+ * but the proxy must start before any container. Override via CREDENTIAL_PROXY_HOST
+ * in .env if the default gateway differs.
  */
 export const PROXY_BIND_HOST =
-  process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
-
-function detectProxyBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
-
-  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
-
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
-  const ifaces = os.networkInterfaces();
-  const docker0 = ifaces['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
-    if (ipv4) return ipv4.address;
-  }
-  return '0.0.0.0';
-}
+  process.env.CREDENTIAL_PROXY_HOST || '192.168.64.1';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
-  }
+  // Apple Container resolves host networking through the bridge gateway directly.
   return [];
 }
 
@@ -54,62 +65,60 @@ export function readonlyMountArgs(
   hostPath: string,
   containerPath: string,
 ): string[] {
-  return ['-v', `${hostPath}:${containerPath}:ro`];
+  return [
+    '--mount',
+    `type=bind,source=${hostPath},target=${containerPath},readonly`,
+  ];
 }
 
-/** Returns the shell command to stop a container by name. */
-export function stopContainer(name: string): string {
-  return `${CONTAINER_RUNTIME_BIN} stop ${name}`;
+/** Stop a container by name. Validates name to avoid shell injection. */
+export function stopContainer(name: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
+    throw new Error(`Invalid container name: ${name}`);
+  }
+  execSync(`${CONTAINER_RUNTIME_BIN} stop ${name}`, { stdio: 'pipe' });
 }
 
-/** Ensure the container runtime is running, retrying with backoff for up to ~2 minutes. */
-export async function ensureContainerRuntimeRunning(): Promise<void> {
-  const maxAttempts = 12;
-  const retryDelayMs = 10_000;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+/** Ensure the container runtime is running, starting it if needed. */
+export function ensureContainerRuntimeRunning(): void {
+  try {
+    execSync(`${CONTAINER_RUNTIME_BIN} system status`, { stdio: 'pipe' });
+    logger.debug('Container runtime already running');
+  } catch {
+    logger.info('Starting container runtime...');
     try {
-      execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+      execSync(`${CONTAINER_RUNTIME_BIN} system start`, {
         stdio: 'pipe',
-        timeout: 10000,
+        timeout: 30000,
       });
-      logger.debug('Container runtime already running');
-      return;
+      logger.info('Container runtime started');
     } catch (err) {
-      if (attempt < maxAttempts) {
-        logger.warn(
-          { attempt, maxAttempts },
-          `Container runtime not ready, retrying in ${retryDelayMs / 1000}s...`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-      } else {
-        logger.error({ err }, 'Failed to reach container runtime');
-        console.error(
-          '\n╔════════════════════════════════════════════════════════════════╗',
-        );
-        console.error(
-          '║  FATAL: Container runtime failed to start                      ║',
-        );
-        console.error(
-          '║                                                                ║',
-        );
-        console.error(
-          '║  Agents cannot run without a container runtime. To fix:        ║',
-        );
-        console.error(
-          '║  1. Ensure Docker is installed and running                     ║',
-        );
-        console.error(
-          '║  2. Run: docker info                                           ║',
-        );
-        console.error(
-          '║  3. Restart NanoClaw                                           ║',
-        );
-        console.error(
-          '╚════════════════════════════════════════════════════════════════╝\n',
-        );
-        throw new Error('Container runtime is required but failed to start');
-      }
+      logger.error({ err }, 'Failed to start container runtime');
+      console.error(
+        '\n╔════════════════════════════════════════════════════════════════╗',
+      );
+      console.error(
+        '║  FATAL: Container runtime failed to start                      ║',
+      );
+      console.error(
+        '║                                                                ║',
+      );
+      console.error(
+        '║  Agents cannot run without a container runtime. To fix:        ║',
+      );
+      console.error(
+        '║  1. Ensure Apple Container is installed                        ║',
+      );
+      console.error(
+        '║  2. Run: container system start                                ║',
+      );
+      console.error(
+        '║  3. Restart NanoClaw                                           ║',
+      );
+      console.error(
+        '╚════════════════════════════════════════════════════════════════╝\n',
+      );
+      throw new Error('Container runtime is required but failed to start');
     }
   }
 }
@@ -117,19 +126,21 @@ export async function ensureContainerRuntimeRunning(): Promise<void> {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
-      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
-    );
-    // Filter out the current sandbox container (its name also starts with nanoclaw-)
-    const hostname = os.hostname();
-    const orphans = output
-      .trim()
-      .split('\n')
-      .filter((n) => n && n !== hostname);
+    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    const containers: { status: string; configuration: { id: string } }[] =
+      JSON.parse(output || '[]');
+    const orphans = containers
+      .filter(
+        (c) =>
+          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
+      )
+      .map((c) => c.configuration.id);
     for (const name of orphans) {
       try {
-        execSync(stopContainer(name), { stdio: 'pipe' });
+        stopContainer(name);
       } catch {
         /* already stopped */
       }

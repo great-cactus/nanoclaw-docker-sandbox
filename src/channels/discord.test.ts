@@ -92,11 +92,17 @@ vi.mock('discord.js', () => {
   // Mock TextChannel type
   class TextChannel {}
 
+  const Partials = {
+    Channel: 'Channel',
+    Message: 'Message',
+  };
+
   return {
     Client: MockClient,
     Events,
     GatewayIntentBits,
     TextChannel,
+    Partials,
   };
 });
 
