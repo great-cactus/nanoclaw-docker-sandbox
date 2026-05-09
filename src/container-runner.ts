@@ -10,6 +10,7 @@ import path from 'path';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_STARTUP_TIMEOUT,
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
   DATA_DIR,
@@ -516,14 +517,34 @@ export async function runContainerAgent(
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
 
+    // Apple Container occasionally drops a freshly-created VM into a
+    // half-dead state where `container ls` reports it as gone but the
+    // host-side `script ... container run` wrapper stays attached, never
+    // sees stdout, and never exits. Without a short watchdog, the queue
+    // would sit blocked on that container until the 30-min hard timeout.
+    // If we have not received the first piece of streaming output within
+    // CONTAINER_STARTUP_TIMEOUT, kill the wrapper so the close handler
+    // fires and the queue can retry.
+    const startupWatchdog = setTimeout(() => {
+      if (!hadStreamingOutput) {
+        logger.error(
+          { group: group.name, containerName, ms: CONTAINER_STARTUP_TIMEOUT },
+          'No output before startup timeout — killing stuck container',
+        );
+        killOnTimeout();
+      }
+    }, CONTAINER_STARTUP_TIMEOUT);
+
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
       clearTimeout(timeout);
+      clearTimeout(startupWatchdog);
       timeout = setTimeout(killOnTimeout, timeoutMs);
     };
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      clearTimeout(startupWatchdog);
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -745,6 +766,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      clearTimeout(startupWatchdog);
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

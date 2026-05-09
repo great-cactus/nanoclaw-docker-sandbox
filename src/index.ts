@@ -4,6 +4,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CONTAINER_IMAGE,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -24,6 +25,7 @@ import {
 } from './container-runner.js';
 import {
   cleanupOrphans,
+  ensureBridgeSentinel,
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
 } from './container-runtime.js';
@@ -465,6 +467,7 @@ function recoverPendingMessages(): void {
 async function ensureContainerSystemRunning(): Promise<void> {
   await ensureContainerRuntimeRunning();
   cleanupOrphans();
+  await ensureBridgeSentinel(CONTAINER_IMAGE);
 }
 
 async function main(): Promise<void> {

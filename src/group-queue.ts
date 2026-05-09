@@ -2,7 +2,11 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import {
+  CONTAINER_SPAWN_STAGGER_MS,
+  DATA_DIR,
+  MAX_CONCURRENT_CONTAINERS,
+} from './config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -34,6 +38,27 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  /**
+   * Sequential gate that staggers consecutive container spawns. Apple
+   * Container hangs in the "Starting container" phase when many VM creates
+   * fire at once (typical when several overdue cron tasks all dispatch at
+   * startup). Each caller chains onto the previous gate, then publishes its
+   * own gate that releases CONTAINER_SPAWN_STAGGER_MS later — so creates are
+   * serialized AND spaced out, not just timestamp-throttled.
+   */
+  private spawnGate: Promise<void> = Promise.resolve();
+
+  private async throttleSpawn(): Promise<void> {
+    if (CONTAINER_SPAWN_STAGGER_MS <= 0) return;
+    const prev = this.spawnGate;
+    let release!: () => void;
+    this.spawnGate = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    const timer = setTimeout(release, CONTAINER_SPAWN_STAGGER_MS);
+    timer.unref();
+  }
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -209,6 +234,8 @@ export class GroupQueue {
       'Starting container for group',
     );
 
+    await this.throttleSpawn();
+
     try {
       if (this.processMessagesFn) {
         const success = await this.processMessagesFn(groupJid);
@@ -243,6 +270,8 @@ export class GroupQueue {
       { groupJid, taskId: task.id, activeCount: this.activeCount },
       'Running queued task',
     );
+
+    await this.throttleSpawn();
 
     try {
       await task.fn();

@@ -2,10 +2,21 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import os from 'os';
 
 import { logger } from './logger.js';
+
+const COMMAND_TIMEOUT_MS = 10_000;
+
+/**
+ * Name of the long-running container we keep alive solely so Apple Container's
+ * bridge100 interface stays up. Without at least one running container, the
+ * bridge tears down and the credential proxy cannot bind to 192.168.64.1.
+ */
+export const BRIDGE_SENTINEL_NAME = 'nanoclaw-bridge-sentinel';
+const BRIDGE_READY_TIMEOUT_MS = 30_000;
+const BRIDGE_POLL_INTERVAL_MS = 200;
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'container';
@@ -71,18 +82,43 @@ export function readonlyMountArgs(
   ];
 }
 
-/** Stop a container by name. Validates name to avoid shell injection. */
+/**
+ * Stop a container by name. Validates name to avoid shell injection.
+ *
+ * Apple Container's `container stop` can hang indefinitely against VMs
+ * that are in a half-dead daemon state. We spawn it non-blocking and
+ * rely on a hard kill timer so a stuck `container stop` never freezes
+ * the orchestrator's Node event loop (which would stall every channel).
+ */
 export function stopContainer(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop ${name}`, { stdio: 'pipe' });
+  const child = spawn(CONTAINER_RUNTIME_BIN, ['stop', name], {
+    stdio: 'ignore',
+    detached: true,
+  });
+  child.on('error', (err) => {
+    logger.warn({ name, err }, 'container stop spawn error');
+  });
+  const killTimer = setTimeout(() => {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already dead */
+    }
+  }, COMMAND_TIMEOUT_MS);
+  killTimer.unref();
+  child.unref();
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} system status`, { stdio: 'pipe' });
+    execSync(`${CONTAINER_RUNTIME_BIN} system status`, {
+      stdio: 'pipe',
+      timeout: COMMAND_TIMEOUT_MS,
+    });
     logger.debug('Container runtime already running');
   } catch {
     logger.info('Starting container runtime...');
@@ -123,19 +159,85 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
+function isBridgeUp(): boolean {
+  const ifaces = os.networkInterfaces();
+  const bridge = ifaces['bridge100'];
+  if (!bridge) return false;
+  return bridge.some((a) => a.family === 'IPv4');
+}
+
+async function waitForBridge(timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (isBridgeUp()) return true;
+    await new Promise((r) => setTimeout(r, BRIDGE_POLL_INTERVAL_MS));
+  }
+  return false;
+}
+
+/**
+ * Spawn a long-running sleep container so Apple Container's bridge100
+ * interface stays up. The credential proxy must bind to 192.168.64.1, but
+ * that address only exists while at least one container runs. Without this
+ * sentinel, a clean restart fails with EADDRNOTAVAIL the moment all real
+ * containers exit. The sentinel is detached, named, and `cleanupOrphans`
+ * skips it so it survives orchestrator restarts.
+ */
+export async function ensureBridgeSentinel(image: string): Promise<void> {
+  if (isBridgeUp()) {
+    logger.debug('bridge100 already up — skipping sentinel');
+    return;
+  }
+  logger.info({ name: BRIDGE_SENTINEL_NAME }, 'Spawning bridge sentinel');
+  const child = spawn(
+    'script',
+    [
+      '-q',
+      '/dev/null',
+      CONTAINER_RUNTIME_BIN,
+      'run',
+      '--rm',
+      '--detach',
+      '--name',
+      BRIDGE_SENTINEL_NAME,
+      '--memory',
+      '256m',
+      '--entrypoint',
+      '/bin/sleep',
+      image,
+      'infinity',
+    ],
+    { stdio: 'ignore', detached: true },
+  );
+  child.on('error', (err) => {
+    logger.error({ err }, 'Failed to spawn bridge sentinel');
+  });
+  child.unref();
+  const ready = await waitForBridge(BRIDGE_READY_TIMEOUT_MS);
+  if (!ready) {
+    throw new Error(
+      `bridge100 did not come up within ${BRIDGE_READY_TIMEOUT_MS}ms — sentinel may have failed to start`,
+    );
+  }
+  logger.info('bridge100 is up');
+}
+
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
     const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
+      timeout: COMMAND_TIMEOUT_MS,
     });
     const containers: { status: string; configuration: { id: string } }[] =
       JSON.parse(output || '[]');
     const orphans = containers
       .filter(
         (c) =>
-          c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'),
+          c.status === 'running' &&
+          c.configuration.id.startsWith('nanoclaw-') &&
+          c.configuration.id !== BRIDGE_SENTINEL_NAME,
       )
       .map((c) => c.configuration.id);
     for (const name of orphans) {
