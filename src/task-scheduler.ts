@@ -9,6 +9,7 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
+  getAllRegisteredGroups,
   getAllTasks,
   getDueTasks,
   getTaskById,
@@ -108,10 +109,14 @@ async function runTask(
     'Running scheduled task',
   );
 
-  const groups = deps.registeredGroups();
-  const group = Object.values(groups).find(
-    (g) => g.folder === task.group_folder,
-  );
+  // Re-read from DB so container_config changes take effect without restart.
+  // Fall back to the in-memory map if the DB read returns nothing.
+  const freshGroups = getAllRegisteredGroups();
+  const group =
+    Object.values(freshGroups).find((g) => g.folder === task.group_folder) ??
+    Object.values(deps.registeredGroups()).find(
+      (g) => g.folder === task.group_folder,
+    );
 
   if (!group) {
     logger.error(

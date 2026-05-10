@@ -145,7 +145,9 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  // Re-read from DB each time so container_config changes (e.g. mount path fixes)
+  // take effect without requiring a sentinel restart.
+  const group = getRegisteredGroup(chatJid) ?? registeredGroups[chatJid];
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
