@@ -261,6 +261,38 @@ function listGhostRuntimeCandidates(): { pid: number; uuid: string }[] {
 }
 
 /**
+ * Kill the container-runtime-linux process for a specific container uuid.
+ *
+ * Apple Container's `container stop` does not always cause the per-VM
+ * runtime to exit. If left alive, these orphan runtimes accumulate and
+ * eventually wedge the apiserver with XPC connection errors, blocking
+ * all subsequent bootstraps. Called from runtime timeout paths so a
+ * single stuck container does not poison the next attempt.
+ */
+export function killRuntimeByUuid(uuid: string): boolean {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(uuid)) return false;
+  if (uuid === BRIDGE_SENTINEL_NAME) return false;
+  let found = false;
+  for (const p of listGhostRuntimeCandidates()) {
+    if (p.uuid !== uuid) continue;
+    found = true;
+    try {
+      process.kill(p.pid, 'SIGKILL');
+      logger.warn(
+        { pid: p.pid, uuid },
+        'Reaped lingering container-runtime-linux after timeout',
+      );
+    } catch (err) {
+      logger.warn(
+        { err, pid: p.pid, uuid },
+        'Failed to reap container-runtime-linux',
+      );
+    }
+  }
+  return found;
+}
+
+/**
  * Kill orphaned NanoClaw containers from previous runs.
  *
  * Two cleanup passes:

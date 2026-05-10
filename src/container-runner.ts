@@ -25,6 +25,7 @@ import {
   CONTAINER_RUNTIME_BIN,
   containerRunSpawn,
   hostGatewayArgs,
+  killRuntimeByUuid,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
@@ -513,6 +514,22 @@ export async function runContainerAgent(
       // Apple Container's `container stop` stops the VM but does not cause
       // the `container run` client process to exit on its own.
       container.kill('SIGKILL');
+      // Apple Container can leave the per-VM container-runtime-linux process
+      // alive after `container stop`. If those orphans accumulate, the
+      // apiserver wedges with XPC connection errors and every subsequent
+      // bootstrap fails. Reap this container's runtime after a short grace
+      // period so the next retry has a clean apiserver to talk to.
+      const reapTimer = setTimeout(() => {
+        try {
+          killRuntimeByUuid(containerName);
+        } catch (err) {
+          logger.warn(
+            { group: group.name, containerName, err },
+            'Post-timeout runtime reap failed',
+          );
+        }
+      }, 5_000);
+      reapTimer.unref();
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
