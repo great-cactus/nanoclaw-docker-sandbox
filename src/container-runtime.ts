@@ -222,16 +222,64 @@ export async function ensureBridgeSentinel(image: string): Promise<void> {
   logger.info('bridge100 is up');
 }
 
-/** Kill orphaned NanoClaw containers from previous runs. */
-export function cleanupOrphans(): void {
+/**
+ * Scan `ps` output for container-runtime-linux processes, returning the
+ * `{pid, uuid}` of any nanoclaw-* container (excluding the bridge sentinel).
+ *
+ * Apple Container's per-VM runtime is launched as
+ * `container-runtime-linux start --root <path> --uuid <name>`. When the
+ * apiserver gets into a half-dead state, these processes can outlive the
+ * apiserver's record of the container — invisible to `container ls` but
+ * still holding host resources (PID, bridge attachment) that block new
+ * VM creates from succeeding.
+ */
+function listGhostRuntimeCandidates(): { pid: number; uuid: string }[] {
+  let output = '';
   try {
-    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
+    output = execSync('ps -ax -o pid=,command=', {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
       timeout: COMMAND_TIMEOUT_MS,
     });
-    const containers: { status: string; configuration: { id: string } }[] =
-      JSON.parse(output || '[]');
+  } catch (err) {
+    logger.warn({ err }, 'Failed to scan for ghost runtime processes');
+    return [];
+  }
+  const procs: { pid: number; uuid: string }[] = [];
+  for (const line of (output || '').split('\n')) {
+    if (!line.includes('container-runtime-linux')) continue;
+    const uuidMatch = line.match(/--uuid\s+(\S+)/);
+    if (!uuidMatch) continue;
+    const uuid = uuidMatch[1];
+    if (!uuid.startsWith('nanoclaw-')) continue;
+    if (uuid === BRIDGE_SENTINEL_NAME) continue;
+    const pidMatch = line.trim().match(/^(\d+)/);
+    if (!pidMatch) continue;
+    procs.push({ pid: Number(pidMatch[1]), uuid });
+  }
+  return procs;
+}
+
+/**
+ * Kill orphaned NanoClaw containers from previous runs.
+ *
+ * Two cleanup passes:
+ *  1. Containers the apiserver still tracks as `running` but no orchestrator
+ *     owns — `container stop` them.
+ *  2. `container-runtime-linux` host processes whose uuid the apiserver no
+ *     longer tracks at all (ghost runtimes) — kill the PID directly. These
+ *     accumulate when Apple Container enters a half-dead state and stop new
+ *     VM creates from making progress until they are reaped.
+ */
+export function cleanupOrphans(): void {
+  let containers: { status: string; configuration: { id: string } }[] = [];
+  try {
+    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --all --format json`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+      timeout: COMMAND_TIMEOUT_MS,
+    });
+    containers = JSON.parse(output || '[]');
     const orphans = containers
       .filter(
         (c) =>
@@ -255,5 +303,31 @@ export function cleanupOrphans(): void {
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
+  }
+
+  const knownIds = new Set(containers.map((c) => c.configuration.id));
+  const ghosts = listGhostRuntimeCandidates().filter(
+    (p) => !knownIds.has(p.uuid),
+  );
+  for (const { pid, uuid } of ghosts) {
+    try {
+      process.kill(pid, 'SIGTERM');
+      const killTimer = setTimeout(() => {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }, 2_000);
+      killTimer.unref();
+    } catch (err) {
+      logger.warn({ err, pid, uuid }, 'Failed to signal ghost runtime process');
+    }
+  }
+  if (ghosts.length > 0) {
+    logger.warn(
+      { count: ghosts.length, ghosts: ghosts.map((g) => g.uuid) },
+      'Killed ghost container-runtime-linux processes (apiserver no longer tracks them)',
+    );
   }
 }

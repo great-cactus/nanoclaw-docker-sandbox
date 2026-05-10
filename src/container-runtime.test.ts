@@ -130,11 +130,13 @@ describe('cleanupOrphans', () => {
       { status: 'running', configuration: { id: 'other-container' } },
     ]);
     mockExecSync.mockReturnValueOnce(lsOutput);
+    // Second execSync call is the ps scan for ghost processes — return empty
+    mockExecSync.mockReturnValueOnce('');
 
     cleanupOrphans();
 
-    // ls is execSync; the stop calls now go through spawn
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    // ls + ps = 2 execSync calls; the stop calls go through spawn
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
     expect(mockSpawn).toHaveBeenCalledTimes(2);
     expect(mockSpawn).toHaveBeenNthCalledWith(
       1,
@@ -156,10 +158,10 @@ describe('cleanupOrphans', () => {
 
   it('does nothing when no orphans exist', () => {
     mockExecSync.mockReturnValueOnce('[]');
-
+    mockExecSync.mockReturnValueOnce(''); // ps scan: no processes
     cleanupOrphans();
 
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
     expect(logger.info).not.toHaveBeenCalled();
   });
 
@@ -182,6 +184,7 @@ describe('cleanupOrphans', () => {
       { status: 'running', configuration: { id: 'nanoclaw-b-2' } },
     ]);
     mockExecSync.mockReturnValueOnce(lsOutput);
+    mockExecSync.mockReturnValueOnce(''); // ps scan
     // First spawn throws synchronously to simulate spawn-time failure
     mockSpawn.mockImplementationOnce(() => {
       throw new Error('spawn failed');
@@ -189,11 +192,57 @@ describe('cleanupOrphans', () => {
 
     cleanupOrphans(); // should not throw
 
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
     expect(mockSpawn).toHaveBeenCalledTimes(2);
     expect(logger.info).toHaveBeenCalledWith(
       { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
       'Stopped orphaned containers',
     );
+  });
+
+  it('kills ghost runtime processes whose uuid the apiserver no longer tracks', () => {
+    const lsOutput = JSON.stringify([
+      { status: 'running', configuration: { id: 'nanoclaw-known-1' } },
+    ]);
+    // ps -ax output: known container, ghost, bridge sentinel, unrelated process
+    const psOutput = [
+      '  100 /usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux start --root /x --uuid nanoclaw-known-1',
+      '  200 /usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux start --root /y --uuid nanoclaw-ghost-2',
+      '  300 /usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux start --root /z --uuid nanoclaw-bridge-sentinel',
+      '  400 /usr/bin/some-other-process --uuid nanoclaw-unrelated',
+      '  500 /usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux start --root /w --uuid other-prefix-xyz',
+    ].join('\n');
+    mockExecSync.mockReturnValueOnce(lsOutput);
+    mockExecSync.mockReturnValueOnce(psOutput);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    cleanupOrphans();
+
+    // Only the ghost (PID 200) should be signalled — known/sentinel/non-runtime are skipped
+    expect(killSpy).toHaveBeenCalledTimes(1);
+    expect(killSpy).toHaveBeenCalledWith(200, 'SIGTERM');
+    expect(logger.warn).toHaveBeenCalledWith(
+      { count: 1, ghosts: ['nanoclaw-ghost-2'] },
+      'Killed ghost container-runtime-linux processes (apiserver no longer tracks them)',
+    );
+    killSpy.mockRestore();
+  });
+
+  it('treats apiserver-known containers in any state as not-ghost', () => {
+    // Stopped container with a still-alive runtime process is the apiserver's
+    // problem to reap, not ours — we must not kill it.
+    const lsOutput = JSON.stringify([
+      { status: 'stopped', configuration: { id: 'nanoclaw-stopping-9' } },
+    ]);
+    const psOutput =
+      '  900 /usr/local/libexec/container/plugins/container-runtime-linux/bin/container-runtime-linux start --root /x --uuid nanoclaw-stopping-9';
+    mockExecSync.mockReturnValueOnce(lsOutput);
+    mockExecSync.mockReturnValueOnce(psOutput);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    cleanupOrphans();
+
+    expect(killSpy).not.toHaveBeenCalled();
+    killSpy.mockRestore();
   });
 });
