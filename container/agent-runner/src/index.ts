@@ -409,6 +409,7 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__gmail__*',
+        'mcp__mcpvault__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -428,6 +429,12 @@ async function runQuery(
           command: 'npx',
           args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
         },
+        ...(fs.existsSync('/workspace/extra/obsidian') ? {
+          mcpvault: {
+            command: 'npx',
+            args: ['-y', '@bitbonsai/mcpvault', '/workspace/extra/obsidian'],
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
