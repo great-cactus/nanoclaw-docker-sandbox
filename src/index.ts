@@ -6,8 +6,10 @@ import {
   ASSISTANT_NAME,
   CONTAINER_IMAGE,
   CREDENTIAL_PROXY_PORT,
+  DATA_DIR,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  SESSION_TRANSCRIPT_MAX_BYTES,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -39,6 +41,7 @@ import {
   getRegisteredGroup,
   getRouterState,
   initDatabase,
+  clearSession,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -265,6 +268,72 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * Resolve the host path of a group's Claude Code session transcript (JSONL).
+ * Mirrors the per-group .claude mount in container-runner.ts; inside the
+ * container cwd is /workspace/group, which Claude Code slugifies to the
+ * project dir "-workspace-group".
+ */
+function sessionTranscriptPath(groupFolder: string, sessionId: string): string {
+  return path.join(
+    DATA_DIR,
+    'sessions',
+    groupFolder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+    `${sessionId}.jsonl`,
+  );
+}
+
+/**
+ * Guard against the resume-hang failure mode: if the stored session's
+ * transcript has grown past SESSION_TRANSCRIPT_MAX_BYTES, archive it and clear
+ * the session mapping so the next spawn starts a fresh, lightweight session.
+ * Done in-process (memory map + DB) so it takes effect without a restart. The
+ * group's durable memory lives in its CLAUDE.md and is untouched.
+ */
+function rotateSessionIfBloated(group: RegisteredGroup): void {
+  const sessionId = sessions[group.folder];
+  if (!sessionId) return;
+
+  const transcript = sessionTranscriptPath(group.folder, sessionId);
+  let size: number;
+  try {
+    size = fs.statSync(transcript).size;
+  } catch {
+    return; // No transcript yet (or unreadable) — nothing to rotate.
+  }
+  if (size <= SESSION_TRANSCRIPT_MAX_BYTES) return;
+
+  try {
+    const archiveDir = path.join(DATA_DIR, 'sessions', '_archived');
+    fs.mkdirSync(archiveDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dest = path.join(
+      archiveDir,
+      `${group.folder}-${sessionId}-${stamp}.jsonl`,
+    );
+    fs.renameSync(transcript, dest);
+    delete sessions[group.folder];
+    clearSession(group.folder);
+    logger.warn(
+      {
+        group: group.name,
+        sizeBytes: size,
+        limitBytes: SESSION_TRANSCRIPT_MAX_BYTES,
+        archivedTo: dest,
+      },
+      'Session transcript exceeded size limit — rotated to a fresh session',
+    );
+  } catch (err) {
+    logger.error(
+      { group: group.name, err: (err as Error).message },
+      'Failed to rotate bloated session transcript',
+    );
+  }
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
@@ -272,6 +341,7 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
+  rotateSessionIfBloated(group);
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)

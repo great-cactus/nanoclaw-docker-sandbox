@@ -58,6 +58,21 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
+/**
+ * Maximum on-disk size of a group's Claude Code session transcript (JSONL)
+ * before we rotate it. The orchestrator resumes the stored session on every
+ * spawn, and Claude Code reads the whole transcript to do so — auto-compaction
+ * bounds the model context but NOT this file, which grows unbounded. Past a few
+ * MB the resume can exceed CONTAINER_STARTUP_TIMEOUT, so every spawn hangs and
+ * is killed with "No output before startup timeout". Rotation archives the
+ * bloated transcript and starts a fresh session (durable memory in the group's
+ * CLAUDE.md is unaffected). 8MB leaves comfortable headroom under the 120s
+ * startup budget while preserving long conversational continuity.
+ */
+export const SESSION_TRANSCRIPT_MAX_BYTES = parseInt(
+  process.env.SESSION_TRANSCRIPT_MAX_BYTES || '8388608',
+  10,
+); // 8MB default
 export const CREDENTIAL_PROXY_PORT = parseInt(
   process.env.CREDENTIAL_PROXY_PORT || '3001',
   10,
