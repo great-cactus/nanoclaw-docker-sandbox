@@ -41,3 +41,7 @@ openclaw.tar.gz
 nanoclaw.db
 .claude/settings.local.json
 .git.corrupted-backup/
+
+# LiveSync Bridge (save point)
+!groups/main/start-livesync-bridge.sh
+!groups/main/livesync-bridge/dat/config.template.json

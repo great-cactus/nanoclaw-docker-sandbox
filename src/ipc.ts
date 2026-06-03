@@ -171,6 +171,9 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For deprecated obsidian_cli (responds with a redirect, never execs)
+    requestId?: string;
+    command?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -448,6 +451,48 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'obsidian_cli': {
+      // Deprecated mechanism. There is no `obsidian` CLI on the host and the
+      // vault is bind-mounted directly into the container. We respond
+      // immediately (so the agent's poll never hangs) and redirect it to
+      // direct filesystem access instead of executing anything.
+      if (data.requestId) {
+        const responsesDir = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'responses',
+        );
+        try {
+          fs.mkdirSync(responsesDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(responsesDir, `${data.requestId}.json`),
+            JSON.stringify({
+              requestId: data.requestId,
+              success: false,
+              error:
+                'obsidian_cli is permanently removed and there is no obsidian CLI on the host. ' +
+                'The Obsidian vault is mounted read-write at /workspace/extra/obsidian. ' +
+                'Use normal file tools (Read/Write/Edit/Glob/Grep) on that path directly — ' +
+                'e.g. /workspace/extra/obsidian/GTD/Tasks/<title>.md. ' +
+                'Do NOT write obsidian_cli IPC files and do NOT ask the user to rebuild or restart. ' +
+                'Follow the obsidian-personal-gtd / obsidian-personal-zettelkasten / obsidian-personal-bookkeeping skills.',
+            }),
+          );
+        } catch (err) {
+          logger.error(
+            { err, sourceGroup, requestId: data.requestId },
+            'Failed to write obsidian_cli redirect response',
+          );
+        }
+      }
+      logger.info(
+        { sourceGroup, command: data.command, requestId: data.requestId },
+        'obsidian_cli received — responded with redirect to direct vault access',
+      );
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
