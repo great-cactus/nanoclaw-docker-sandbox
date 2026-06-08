@@ -39,6 +39,27 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+/**
+ * Memory allocated to each agent container. Apple Container (and Docker)
+ * default an unconstrained VM to ~1GB, which is far too small for builds,
+ * test suites, or any large-scale dev work — the guest OOM-kills node/tsc
+ * mid-task and the spawn dies with no useful output.
+ *
+ * This is a dedicated NanoClaw host (24GB RAM / 12 CPU), so the default
+ * hands almost everything to the agent: 18GB leaves ~6GB for macOS, the
+ * orchestrator, and the runtime daemon. NOTE: this is a PER-container limit
+ * and groups can run containers concurrently — two heavy agents at once will
+ * oversubscribe host RAM. Lower this if you routinely run multiple groups in
+ * parallel. Accepts the runtime's size syntax (e.g. "18g", "2048m"); empty
+ * string leaves the limit unset.
+ */
+export const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY ?? '18g';
+/**
+ * CPUs allocated to each agent container. Dedicated host has 12 cores; the
+ * default leaves 2 for the host + orchestrator. Empty string leaves the
+ * runtime's own default in place.
+ */
+export const CONTAINER_CPUS = process.env.CONTAINER_CPUS ?? '10';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,

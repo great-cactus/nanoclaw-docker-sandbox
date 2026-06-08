@@ -8,8 +8,10 @@ import os from 'os';
 import path from 'path';
 
 import {
+  CONTAINER_CPUS,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_MEMORY,
   CONTAINER_STARTUP_TIMEOUT,
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
@@ -245,6 +247,16 @@ function buildContainerArgs(
   isMain: boolean,
 ): string[] {
   const args: string[] = ['run', '--rm', '--name', containerName];
+
+  // Resource limits. Without these the runtime defaults the VM to ~1GB, which
+  // OOM-kills builds/test suites mid-task; CONTAINER_MEMORY/CONTAINER_CPUS make
+  // them tunable per host. Empty strings leave the runtime default in place.
+  if (CONTAINER_MEMORY) {
+    args.push('--memory', CONTAINER_MEMORY);
+  }
+  if (CONTAINER_CPUS) {
+    args.push('--cpus', CONTAINER_CPUS);
+  }
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
