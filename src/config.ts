@@ -45,21 +45,26 @@ export const CONTAINER_IMAGE =
  * test suites, or any large-scale dev work — the guest OOM-kills node/tsc
  * mid-task and the spawn dies with no useful output.
  *
- * This is a dedicated NanoClaw host (24GB RAM / 12 CPU), so the default
- * hands almost everything to the agent: 18GB leaves ~6GB for macOS, the
- * orchestrator, and the runtime daemon. NOTE: this is a PER-container limit
- * and groups can run containers concurrently — two heavy agents at once will
- * oversubscribe host RAM. Lower this if you routinely run multiple groups in
- * parallel. Accepts the runtime's size syntax (e.g. "18g", "2048m"); empty
- * string leaves the limit unset.
+ * This is a dedicated NanoClaw host (24GB RAM / 12 CPU). Do NOT hand almost
+ * all RAM to the VM: Apple Container reserves the full --memory amount up front
+ * for the guest, and macOS + the orchestrator + the apiserver daemon + the
+ * always-on bridge-sentinel container + virtualization overhead need real
+ * headroom. Allocating 18GB on this box drove the host to ~13% free with heavy
+ * swapping, so VMs booted half-dead and every spawn died at the 120s
+ * "no output" timeout (and the few that survived took minutes to respond).
+ * 8GB leaves ~16GB for the host and still dwarfs the ~1GB default that was
+ * OOM-killing builds. NOTE: this is a PER-container limit and groups can run
+ * containers concurrently — keep it well under host RAM so two heavy agents at
+ * once don't oversubscribe. Accepts the runtime's size syntax (e.g. "8g",
+ * "2048m"); empty string leaves the limit unset.
  */
-export const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY ?? '18g';
+export const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY ?? '8g';
 /**
- * CPUs allocated to each agent container. Dedicated host has 12 cores; the
- * default leaves 2 for the host + orchestrator. Empty string leaves the
- * runtime's own default in place.
+ * CPUs allocated to each agent container. Dedicated host has 12 cores; 8 keeps
+ * the agent fast while leaving cores for the host, orchestrator, and a second
+ * concurrent group. Empty string leaves the runtime's own default in place.
  */
-export const CONTAINER_CPUS = process.env.CONTAINER_CPUS ?? '10';
+export const CONTAINER_CPUS = process.env.CONTAINER_CPUS ?? '8';
 export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,
@@ -75,6 +80,21 @@ export const CONTAINER_STARTUP_TIMEOUT = parseInt(
   process.env.CONTAINER_STARTUP_TIMEOUT || '120000',
   10,
 );
+/**
+ * Maximum time we wait for the guest agent-runner to emit ANY output (its
+ * "[agent-runner]" log lines, on stdout or stderr) before declaring the VM
+ * wedged and killing it. Apple Container intermittently boots a half-dead VM
+ * that prints the host-side progress bars and then goes silent forever — the
+ * guest node process never starts. A healthy VM emits its first "[agent-runner]"
+ * line within ~3-5s (well before the model produces any result), so this short
+ * window catches wedged VMs ~6x faster than CONTAINER_STARTUP_TIMEOUT without
+ * risking a false kill of a healthy-but-slow first turn (which may take 30s+ to
+ * produce its first result marker).
+ */
+export const FIRST_OUTPUT_TIMEOUT = parseInt(
+  process.env.FIRST_OUTPUT_TIMEOUT || '20000',
+  10,
+); // 20s default
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
