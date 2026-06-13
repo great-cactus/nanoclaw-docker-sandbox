@@ -45,18 +45,25 @@ export const CONTAINER_IMAGE =
  * test suites, or any large-scale dev work — the guest OOM-kills node/tsc
  * mid-task and the spawn dies with no useful output.
  *
- * This is a dedicated NanoClaw host (24GB RAM / 12 CPU). Do NOT hand almost
- * all RAM to the VM: Apple Container reserves the full --memory amount up front
- * for the guest, and macOS + the orchestrator + the apiserver daemon + the
- * always-on bridge-sentinel container + virtualization overhead need real
- * headroom. Allocating 18GB on this box drove the host to ~13% free with heavy
- * swapping, so VMs booted half-dead and every spawn died at the 120s
- * "no output" timeout (and the few that survived took minutes to respond).
- * 8GB leaves ~16GB for the host and still dwarfs the ~1GB default that was
- * OOM-killing builds. NOTE: this is a PER-container limit and groups can run
- * containers concurrently — keep it well under host RAM so two heavy agents at
- * once don't oversubscribe. Accepts the runtime's size syntax (e.g. "8g",
+ * Host is a 24GB / 12-CPU Mac. This is a PER-container CAP, not an up-front
+ * reservation: Apple Virtualization backs the guest with a Virtio memory
+ * balloon and only consumes host pages the guest actually touches (~1GB for a
+ * typical agent run), so the --memory value alone barely moves host memory.
+ * Verified 2026-06-13: stopping every nanoclaw container changed host "wired"
+ * by <0.1GB. So keep this generous enough that builds/test suites don't get
+ * OOM-killed (the ~1GB runtime default did), but below host RAM so concurrent
+ * groups don't oversubscribe. Accepts the runtime's size syntax (e.g. "8g",
  * "2048m"); empty string leaves the limit unset.
+ *
+ * 2026-06-13 post-mortem: the morning's mass spawn-hangs (every VM dying at the
+ * 120s "no output" timeout) were NOT a container-sizing problem. The real cause
+ * was a co-resident `llama.cpp llama-server` running a 26B model with -ngl 99,
+ * whose Metal GPU-resident weights + KV cache held ~14GB of host "wired" memory
+ * (invisible in the process's phys_footprint). That left the host at ~14% free
+ * and swapping, so VM boots thrashed. Stopping llama-server dropped wired from
+ * ~16.8GB to ~2.9GB (macOS baseline). With llama-server stopped there is ample
+ * headroom, so 8GB is safe; if it is run again, drop this to 4g via the
+ * CONTAINER_MEMORY env override to avoid oversubscription.
  */
 export const CONTAINER_MEMORY = process.env.CONTAINER_MEMORY ?? '8g';
 /**
@@ -107,13 +114,15 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
  * MB the resume can exceed CONTAINER_STARTUP_TIMEOUT, so every spawn hangs and
  * is killed with "No output before startup timeout". Rotation archives the
  * bloated transcript and starts a fresh session (durable memory in the group's
- * CLAUDE.md is unaffected). 8MB leaves comfortable headroom under the 120s
- * startup budget while preserving long conversational continuity.
+ * CLAUDE.md is unaffected). Observed in practice: a ~6MB transcript already
+ * blew the 120s startup budget and hung every spawn, while the old 8MB ceiling
+ * never tripped — so the guard slept right through the failure. 4MB keeps a
+ * safe margin below the empirical hang point while preserving continuity.
  */
 export const SESSION_TRANSCRIPT_MAX_BYTES = parseInt(
-  process.env.SESSION_TRANSCRIPT_MAX_BYTES || '8388608',
+  process.env.SESSION_TRANSCRIPT_MAX_BYTES || '4194304',
   10,
-); // 8MB default
+); // 4MB default
 export const CREDENTIAL_PROXY_PORT = parseInt(
   process.env.CREDENTIAL_PROXY_PORT || '3001',
   10,
