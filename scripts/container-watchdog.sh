@@ -31,6 +31,10 @@ LOG="$PROJECT_DIR/logs/nanoclaw.log"
 WATCHDOG_LOG="$PROJECT_DIR/logs/watchdog.log"
 STATE_DIR="$PROJECT_DIR/data/watchdog"
 LAST_RECOVERY_FILE="$STATE_DIR/last-recovery"
+# Byte offset into $LOG recorded at the moment of the last recovery. is_stuck()
+# only inspects log content written AFTER this point, so the timeout lines that
+# triggered a recovery cannot keep re-triggering recoveries on every cooldown.
+LAST_RECOVERY_OFFSET_FILE="$STATE_DIR/last-recovery-log-offset"
 SERVICE_LABEL="com.nanoclaw"
 
 # Number of startup timeouts (since the last success) that means "stuck".
@@ -82,17 +86,38 @@ cleanup() {
 
 # --- 2. RECOVERY -----------------------------------------------------------
 # Stuck = at least TIMEOUT_THRESHOLD "No output before startup timeout" lines
-# AFTER the most recent successful completion, within the recent log tail.
+# AFTER the most recent successful completion, considering ONLY log content
+# written since the last recovery.
+#
+# The post-recovery scoping is essential: a recovery restarts the orchestrator
+# but does not itself emit a success line, so the timeout lines that justified
+# the recovery linger in the recent tail. Without scoping, is_stuck() would stay
+# true on the next run and fire another recovery the moment the cooldown lapses
+# — an infinite restart loop that re-initializes the orchestrator (and drops the
+# user's in-flight chat) every cooldown interval. By ignoring everything logged
+# before the last recovery we require *fresh* timeouts to accumulate before
+# recovering again, so a genuine recovery that worked stays quiet.
 is_stuck() {
   [ -f "$LOG" ] || return 1
-  local tail_buf last_success_line timeouts_after
-  tail_buf=$(tail -n "$TAIL_LINES" "$LOG")
+  local log_size start_off slice last_success_line timeouts_after
+  log_size=$(wc -c < "$LOG" 2>/dev/null | tr -dc '0-9')
+  : "${log_size:=0}"
+  start_off=$(tr -dc '0-9' < "$LAST_RECOVERY_OFFSET_FILE" 2>/dev/null)
+  : "${start_off:=0}"
+  # Guard against a rotated/truncated log (offset now past EOF).
+  if ! [[ "$start_off" =~ ^[0-9]+$ ]] || [ "$start_off" -gt "$log_size" ]; then
+    start_off=0
+  fi
 
-  # Line number (within the tail) of the most recent success signal.
-  last_success_line=$(grep -nE "Container completed|Container timed out after output|Agent output" <<< "$tail_buf" | tail -1 | cut -d: -f1)
+  # Inspect only the bytes written after the last recovery, then bound the work
+  # to the most recent TAIL_LINES lines of that slice.
+  slice=$(tail -c +"$((start_off + 1))" "$LOG" | tail -n "$TAIL_LINES")
+
+  # Line number (within the slice) of the most recent success signal.
+  last_success_line=$(grep -nE "Container completed|Container timed out after output|Agent output" <<< "$slice" | tail -1 | cut -d: -f1)
   : "${last_success_line:=0}"
 
-  timeouts_after=$(tail -n +"$((last_success_line + 1))" <<< "$tail_buf" \
+  timeouts_after=$(tail -n +"$((last_success_line + 1))" <<< "$slice" \
     | grep -c "No output before startup timeout")
 
   [ "$timeouts_after" -ge "$TIMEOUT_THRESHOLD" ]
@@ -109,6 +134,10 @@ in_cooldown() {
 recover() {
   log "RECOVERY: stuck-spawn pattern detected — restarting apiserver + orchestrator"
   date +%s > "$LAST_RECOVERY_FILE"
+  # Mark the current end of the log: only timeouts logged AFTER this point may
+  # justify the next recovery, so the lines that triggered this one can't loop.
+  { wc -c < "$LOG" 2>/dev/null | tr -dc '0-9' || true; } > "$LAST_RECOVERY_OFFSET_FILE"
+  [ -s "$LAST_RECOVERY_OFFSET_FILE" ] || echo 0 > "$LAST_RECOVERY_OFFSET_FILE"
 
   container system stop  >> "$WATCHDOG_LOG" 2>&1
   sleep 3
