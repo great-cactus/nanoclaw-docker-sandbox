@@ -431,6 +431,10 @@ export async function runContainerAgent(
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
+      // Any output means the container isn't silently wedged — keep the
+      // pre-result inactivity net alive so a long first turn isn't false-killed.
+      bumpStartupWatchdog();
+
       // First guest output ("[agent-runner]" log line) proves the VM booted and
       // the agent-runner process is alive — clears the fast first-output
       // watchdog. (pty-merged runs surface these on stdout.)
@@ -491,6 +495,11 @@ export async function runContainerAgent(
     container.stderr.on('data', (data) => {
       const chunk = data.toString();
 
+      // SDK debug logs stream here continuously while the agent works — that's
+      // exactly the liveness signal the pre-result inactivity net needs, so
+      // bump it (unlike the hard timeout below, which stays result-only).
+      bumpStartupWatchdog();
+
       // agent-runner logs via console.error (stderr); its first line is the
       // earliest proof the guest is alive, so it also clears the watchdog.
       if (!hadFirstOutput && chunk.includes('[agent-runner]')) {
@@ -502,8 +511,9 @@ export async function runContainerAgent(
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
       }
-      // Don't reset timeout on stderr — SDK writes debug logs continuously.
-      // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
+      // Don't reset the hard timeout on stderr — SDK writes debug logs
+      // continuously. The hard timeout only resets on actual output
+      // (OUTPUT_MARKER in stdout via resetTimeout).
       if (stderrTruncated) return;
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
       if (chunk.length > remaining) {
@@ -567,23 +577,37 @@ export async function runContainerAgent(
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
 
-    // Apple Container occasionally drops a freshly-created VM into a
-    // half-dead state where `container ls` reports it as gone but the
-    // host-side `script ... container run` wrapper stays attached, never
-    // sees stdout, and never exits. Without a short watchdog, the queue
-    // would sit blocked on that container until the 30-min hard timeout.
-    // If we have not received the first piece of streaming output within
-    // CONTAINER_STARTUP_TIMEOUT, kill the wrapper so the close handler
-    // fires and the queue can retry.
-    const startupWatchdog = setTimeout(() => {
-      if (!hadStreamingOutput) {
-        logger.error(
-          { group: group.name, containerName, ms: CONTAINER_STARTUP_TIMEOUT },
-          'No output before startup timeout — killing stuck container',
-        );
-        killOnTimeout();
-      }
-    }, CONTAINER_STARTUP_TIMEOUT);
+    // Pre-result inactivity net. A healthy agent streams continuous output
+    // (SDK debug logs on stderr, IPC/tool activity) while it works toward its
+    // first result — even a long multi-step first turn is never silent for
+    // long. A wedged VM, or a hung session-transcript resume, by contrast goes
+    // completely silent after the "[agent-runner]" preamble. So rather than a
+    // fixed deadline — which false-kills a legitimately long first turn — kill
+    // only after CONTAINER_STARTUP_TIMEOUT of *no output at all*. Re-armed on
+    // every guest output by bumpStartupWatchdog(); cleared for good once the
+    // first result marker arrives (resetTimeout), so it cannot fire during the
+    // post-result idle keep-alive.
+    const killOnStartupSilence = () => {
+      logger.error(
+        { group: group.name, containerName, ms: CONTAINER_STARTUP_TIMEOUT },
+        'No output for startup timeout — killing stuck container',
+      );
+      killOnTimeout();
+    };
+    let startupWatchdog = setTimeout(
+      killOnStartupSilence,
+      CONTAINER_STARTUP_TIMEOUT,
+    );
+    const bumpStartupWatchdog = () => {
+      // Only meaningful before the first result; afterward the hard/idle
+      // timeouts govern and resetTimeout has cleared this net for good.
+      if (hadStreamingOutput) return;
+      clearTimeout(startupWatchdog);
+      startupWatchdog = setTimeout(
+        killOnStartupSilence,
+        CONTAINER_STARTUP_TIMEOUT,
+      );
+    };
 
     // Earlier, cheaper net for the most common failure: a half-dead VM that
     // boots, prints only host-side progress bars, and never starts the guest

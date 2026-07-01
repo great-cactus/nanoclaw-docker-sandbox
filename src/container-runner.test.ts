@@ -211,4 +211,42 @@ describe('container-runner timeout behavior', () => {
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
   });
+
+  it('long first turn kept alive by streaming output is not startup-killed', async () => {
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    // Guest boots and starts streaming within the first-output window.
+    fakeProc.stderr.push('[agent-runner] Starting query...\n');
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Keep streaming SDK debug logs every 60s (< 120s startup timeout) for well
+    // past the old fixed deadline — the inactivity net must keep re-arming so a
+    // legitimately long first turn is not false-killed.
+    for (let i = 0; i < 4; i++) {
+      fakeProc.stderr.push(`[debug] working step ${i}...\n`);
+      await vi.advanceTimersByTimeAsync(60000);
+    }
+    // ~240s elapsed with no result marker, yet the container is still alive.
+    expect(fakeProc.kill).not.toHaveBeenCalled();
+
+    // The agent finally produces its first result.
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'sess-long',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    expect(result.newSessionId).toBe('sess-long');
+  });
 });
