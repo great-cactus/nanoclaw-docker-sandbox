@@ -35,8 +35,9 @@ export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
   private waitingGroups: string[] = [];
-  private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
-    null;
+  private processMessagesFn:
+    | ((groupJid: string, isFinalAttempt: boolean) => Promise<boolean>)
+    | null = null;
   private shuttingDown = false;
   /**
    * Sequential gate that staggers consecutive container spawns. Apple
@@ -80,7 +81,9 @@ export class GroupQueue {
     return state;
   }
 
-  setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
+  setProcessMessagesFn(
+    fn: (groupJid: string, isFinalAttempt: boolean) => Promise<boolean>,
+  ): void {
     this.processMessagesFn = fn;
   }
 
@@ -238,7 +241,12 @@ export class GroupQueue {
 
     try {
       if (this.processMessagesFn) {
-        const success = await this.processMessagesFn(groupJid);
+        // On the final permitted attempt, tell the processor not to roll the
+        // cursor back on a no-output failure. Otherwise the dropped messages
+        // stay "unprocessed" and the poll/recovery re-detects them, restarting
+        // the whole retry cycle — an unbounded container-spawn loop.
+        const isFinalAttempt = state.retryCount >= MAX_RETRIES;
+        const success = await this.processMessagesFn(groupJid, isFinalAttempt);
         if (success) {
           state.retryCount = 0;
         } else {

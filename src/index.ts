@@ -149,7 +149,10 @@ export function _setRegisteredGroups(
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
+async function processGroupMessages(
+  chatJid: string,
+  isFinalAttempt = false,
+): Promise<boolean> {
   // Re-read from DB each time so container_config changes (e.g. mount path fixes)
   // take effect without requiring a sentinel restart.
   const group = getRegisteredGroup(chatJid) ?? registeredGroups[chatJid];
@@ -254,6 +257,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
       return true;
+    }
+    // On the final permitted attempt, give up cleanly: keep the cursor
+    // advanced (set at the top of this function) so the poll/recovery path
+    // doesn't re-detect these messages and restart the retry cycle — the
+    // runaway container-spawn loop. The messages are dropped after MAX_RETRIES.
+    if (isFinalAttempt) {
+      logger.warn(
+        { group: group.name },
+        'Final retry failed with no output — dropping messages, keeping cursor advanced to avoid re-trigger loop',
+      );
+      return false;
     }
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
