@@ -9,9 +9,12 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 // Mock config
 vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
+  CONTAINER_MEMORY: '8g',
+  CONTAINER_CPUS: '8',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
   CONTAINER_STARTUP_TIMEOUT: 120000, // 2min
+  FIRST_OUTPUT_TIMEOUT: 20000, // 20s
   CREDENTIAL_PROXY_PORT: 3001,
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',

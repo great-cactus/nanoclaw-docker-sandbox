@@ -431,6 +431,14 @@ export async function runContainerAgent(
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
+      // First guest output ("[agent-runner]" log line) proves the VM booted and
+      // the agent-runner process is alive — clears the fast first-output
+      // watchdog. (pty-merged runs surface these on stdout.)
+      if (!hadFirstOutput && chunk.includes('[agent-runner]')) {
+        hadFirstOutput = true;
+        clearTimeout(firstOutputWatchdog);
+      }
+
       // Always accumulate for logging
       if (!stdoutTruncated) {
         const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
@@ -482,6 +490,14 @@ export async function runContainerAgent(
 
     container.stderr.on('data', (data) => {
       const chunk = data.toString();
+
+      // agent-runner logs via console.error (stderr); its first line is the
+      // earliest proof the guest is alive, so it also clears the watchdog.
+      if (!hadFirstOutput && chunk.includes('[agent-runner]')) {
+        hadFirstOutput = true;
+        clearTimeout(firstOutputWatchdog);
+      }
+
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
@@ -504,6 +520,10 @@ export async function runContainerAgent(
 
     let timedOut = false;
     let hadStreamingOutput = false;
+    // Distinct from hadStreamingOutput (first *result marker*): this flips on
+    // the first *guest* output ("[agent-runner]" log line), which arrives long
+    // before any result. Drives the fast first-output watchdog below.
+    let hadFirstOutput = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
@@ -565,16 +585,35 @@ export async function runContainerAgent(
       }
     }, CONTAINER_STARTUP_TIMEOUT);
 
+    // Earlier, cheaper net for the most common failure: a half-dead VM that
+    // boots, prints only host-side progress bars, and never starts the guest
+    // agent-runner at all. A healthy VM emits its first "[agent-runner]" line
+    // within ~3-5s, so if we've seen no guest output within FIRST_OUTPUT_TIMEOUT
+    // the VM is wedged — kill it ~6x faster than the result-marker watchdog
+    // above. Kept separate so a healthy-but-slow first turn (which may take 30s+
+    // to produce its first result) is not false-killed.
+    const firstOutputWatchdog = setTimeout(() => {
+      if (!hadFirstOutput) {
+        logger.error(
+          { group: group.name, containerName, ms: FIRST_OUTPUT_TIMEOUT },
+          'No guest output before first-output timeout — killing wedged VM',
+        );
+        killOnTimeout();
+      }
+    }, FIRST_OUTPUT_TIMEOUT);
+
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
       clearTimeout(timeout);
       clearTimeout(startupWatchdog);
+      clearTimeout(firstOutputWatchdog);
       timeout = setTimeout(killOnTimeout, timeoutMs);
     };
 
     container.on('close', (code) => {
       clearTimeout(timeout);
       clearTimeout(startupWatchdog);
+      clearTimeout(firstOutputWatchdog);
       const duration = Date.now() - startTime;
 
       if (timedOut) {
