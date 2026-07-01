@@ -48,7 +48,7 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, ProcessOutcome } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -152,21 +152,19 @@ export function _setRegisteredGroups(
 
 /**
  * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
+ * Called by the GroupQueue when it's this group's turn. Reports facts
+ * (delivered/failed) back to the queue, which owns the retry policy.
  */
-async function processGroupMessages(
-  chatJid: string,
-  isFinalAttempt = false,
-): Promise<boolean> {
+async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
   // Re-read from DB each time so container_config changes (e.g. mount path fixes)
   // take effect without requiring a sentinel restart.
   const group = getRegisteredGroup(chatJid) ?? registeredGroups[chatJid];
-  if (!group) return true;
+  if (!group) return { kind: 'ok' };
 
   const channel = findChannel(channels, chatJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return true;
+    return { kind: 'ok' };
   }
 
   const isMainGroup = group.isMain === true;
@@ -178,7 +176,7 @@ async function processGroupMessages(
     ASSISTANT_NAME,
   );
 
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) return { kind: 'ok' };
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -188,7 +186,7 @@ async function processGroupMessages(
         TRIGGER_PATTERN.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
-    if (!hasTrigger) return true;
+    if (!hasTrigger) return { kind: 'ok' };
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -208,89 +206,69 @@ async function processGroupMessages(
     'Processing messages',
   );
 
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
-  };
-
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    {
+      idleMs: IDLE_TIMEOUT,
+      onIdle: () => queue.closeStdin(chatJid),
+    },
+  );
 
   await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If output already reached the user — via the result marker OR via an
-    // agent-initiated IPC send during this run — don't roll back the cursor.
-    // The user got their response and re-processing would re-run the task and
-    // send duplicates.
+    // Report facts to the queue; it decides whether to retry. "Delivered"
+    // covers both the result marker and agent-initiated IPC sends during
+    // this run — either way the user already got a response.
     const ipcSentDuringRun = (ipcSendCounts[chatJid] ?? 0) > ipcCountBefore;
-    if (outputSentToUser || ipcSentDuringRun) {
-      logger.warn(
-        { group: group.name, ipcSentDuringRun },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
-      );
-      return true;
-    }
-    // On the final permitted attempt, give up cleanly: keep the cursor
-    // advanced (set at the top of this function) so the poll/recovery path
-    // doesn't re-detect these messages and restart the retry cycle — the
-    // runaway container-spawn loop. The messages are dropped after MAX_RETRIES.
-    if (isFinalAttempt) {
-      logger.warn(
-        { group: group.name },
-        'Final retry failed with no output — dropping messages, keeping cursor advanced to avoid re-trigger loop',
-      );
-      return false;
-    }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return false;
+    return {
+      kind: 'failed',
+      delivered: outputSentToUser || ipcSentDuringRun,
+      rollback: () => {
+        lastAgentTimestamp[chatJid] = previousCursor;
+        saveState();
+        logger.warn(
+          { group: group.name },
+          'Agent error, rolled back message cursor for retry',
+        );
+      },
+    };
   }
 
-  return true;
+  return { kind: 'ok' };
 }
 
 /**
@@ -363,7 +341,8 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
+  onOutput: (output: ContainerOutput) => Promise<void>,
+  options?: import('./container-runner.js').RunAgentOptions,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   rotateSessionIfBloated(group);
@@ -395,15 +374,13 @@ async function runAgent(
   );
 
   // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
+  const wrappedOnOutput = async (output: ContainerOutput) => {
+    if (output.newSessionId) {
+      sessions[group.folder] = output.newSessionId;
+      setSession(group.folder, output.newSessionId);
+    }
+    await onOutput(output);
+  };
 
   try {
     const output = await runContainerAgent(
@@ -419,6 +396,7 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      options,
     );
 
     if (output.newSessionId) {

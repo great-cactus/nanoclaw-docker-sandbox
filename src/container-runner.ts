@@ -1,44 +1,40 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in containers and handles IPC
+ * Spawns agent execution in containers and handles IPC.
+ *
+ * Liveness/timeout decisions live in ContainerLifecycle (container-lifecycle.ts);
+ * this module spawns the process, streams and parses its output, and executes
+ * the lifecycle's verdicts (kill / graceful idle wind-down).
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import {
-  CONTAINER_CPUS,
-  CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
-  CONTAINER_MEMORY,
   CONTAINER_STARTUP_TIMEOUT,
   CONTAINER_TIMEOUT,
-  CREDENTIAL_PROXY_PORT,
-  DATA_DIR,
   FIRST_OUTPUT_TIMEOUT,
-  GROUPS_DIR,
   IDLE_TIMEOUT,
-  TIMEZONE,
 } from './config.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
-import { logger } from './logger.js';
+import { ContainerLifecycle, KillReason } from './container-lifecycle.js';
+import { buildContainerArgs, buildVolumeMounts } from './container-mounts.js';
 import {
-  CONTAINER_HOST_GATEWAY,
-  CONTAINER_RUNTIME_BIN,
   containerRunSpawn,
-  hostGatewayArgs,
   killRuntimeByUuid,
-  readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
-import { validateAdditionalMounts } from './mount-security.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Guest liveness signature: agent-runner logs prefixed with this prove the VM
+// booted and the guest process is alive (host-side runtime noise doesn't).
+const GUEST_OUTPUT_SIGNATURE = '[agent-runner]';
 
 export interface ContainerInput {
   prompt: string;
@@ -58,314 +54,28 @@ export interface ContainerOutput {
   error?: string;
 }
 
-interface VolumeMount {
-  hostPath: string;
-  containerPath: string;
-  readonly: boolean;
+export interface RunAgentOptions {
+  /** Inactivity window after the last result before onIdle fires. */
+  idleMs?: number;
+  /** Graceful wind-down request (typically wired to queue.closeStdin). */
+  onIdle?: () => void;
 }
 
-function buildVolumeMounts(
-  group: RegisteredGroup,
-  isMain: boolean,
-): VolumeMount[] {
-  const mounts: VolumeMount[] = [];
-  const projectRoot = process.cwd();
-  const groupDir = resolveGroupFolderPath(group.folder);
-
-  // NanoClaw application logs (read-only for all groups)
-  const logsDir = path.join(projectRoot, 'logs');
-  if (fs.existsSync(logsDir)) {
-    mounts.push({
-      hostPath: logsDir,
-      containerPath: '/workspace/logs',
-      readonly: true,
-    });
-  }
-
-  if (isMain) {
-    // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .claude/) are mounted separately below.
-    // Read-only prevents the agent from modifying host application code
-    // (src/, dist/, package.json, etc.) which would bypass the sandbox
-    // entirely on next restart.
-    mounts.push({
-      hostPath: projectRoot,
-      containerPath: '/workspace/project',
-      readonly: true,
-    });
-
-    // .env shadowing is handled inside the container entrypoint via mount --bind
-    // (Apple Container only supports directory mounts, not file mounts like /dev/null)
-
-    // Main also gets its group folder as the working directory
-    mounts.push({
-      hostPath: groupDir,
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-  } else {
-    // Other groups only get their own folder
-    mounts.push({
-      hostPath: groupDir,
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
-  }
-
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
-
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  }
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
-  });
-
-  // Gmail credentials directory (for Gmail MCP inside the container)
-  const homeDir = os.homedir();
-  const gmailDir = path.join(homeDir, '.gmail-mcp');
-  if (fs.existsSync(gmailDir)) {
-    mounts.push({
-      hostPath: gmailDir,
-      containerPath: '/home/node/.gmail-mcp',
-      readonly: false, // MCP may need to refresh OAuth tokens
-    });
-  }
-
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
-  mounts.push({
-    hostPath: groupIpcDir,
-    containerPath: '/workspace/ipc',
-    readonly: false,
-  });
-
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
-  if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-    }
-  }
-  mounts.push({
-    hostPath: groupAgentRunnerDir,
-    containerPath: '/app/src',
-    readonly: false,
-  });
-
-  // Additional mounts validated against external allowlist (tamper-proof from containers)
-  if (group.containerConfig?.additionalMounts) {
-    const validatedMounts = validateAdditionalMounts(
-      group.containerConfig.additionalMounts,
-      group.name,
-      isMain,
-    );
-    mounts.push(...validatedMounts);
-  }
-
-  return mounts;
-}
-
-function buildContainerArgs(
-  mounts: VolumeMount[],
-  containerName: string,
-  isMain: boolean,
-): string[] {
-  const args: string[] = ['run', '--rm', '--name', containerName];
-
-  // Resource limits. Without these the runtime defaults the VM to ~1GB, which
-  // OOM-kills builds/test suites mid-task; CONTAINER_MEMORY/CONTAINER_CPUS make
-  // them tunable per host. Empty strings leave the runtime default in place.
-  if (CONTAINER_MEMORY) {
-    args.push('--memory', CONTAINER_MEMORY);
-  }
-  if (CONTAINER_CPUS) {
-    args.push('--cpus', CONTAINER_CPUS);
-  }
-
-  // Pass host timezone so container's local time matches the user's
-  args.push('-e', `TZ=${TIMEZONE}`);
-
-  // Forward proxy and CA settings so containers can reach external services
-  const caCertEnvVars = [
-    'NODE_EXTRA_CA_CERTS',
-    'SSL_CERT_FILE',
-    'REQUESTS_CA_BUNDLE',
-  ];
-  for (const envVar of [
-    'HTTP_PROXY',
-    'HTTPS_PROXY',
-    'NO_PROXY',
-    'http_proxy',
-    'https_proxy',
-    'no_proxy',
-    ...caCertEnvVars,
-  ]) {
-    if (process.env[envVar]) {
-      if (caCertEnvVars.includes(envVar)) {
-        args.push('-e', `${envVar}=/workspace/ca-cert/proxy-ca.crt`);
-      } else if (envVar === 'NO_PROXY' || envVar === 'no_proxy') {
-        // Add the host gateway to NO_PROXY so the credential proxy
-        // (ANTHROPIC_BASE_URL) isn't routed through the HTTPS proxy
-        const val = process.env[envVar];
-        const extra = val
-          ? `${val},${CONTAINER_HOST_GATEWAY}`
-          : CONTAINER_HOST_GATEWAY;
-        args.push('-e', `${envVar}=${extra}`);
-      } else {
-        args.push('-e', `${envVar}=${process.env[envVar]}`);
-      }
-    }
-  }
-
-  // Mount CA certificate into container if NODE_EXTRA_CA_CERTS is set.
-  // Docker may reject mounts from restricted host paths, so we copy the cert
-  // into the project's data directory and mount from there.
-  const hostCaCert =
-    process.env.NODE_EXTRA_CA_CERTS || process.env.SSL_CERT_FILE;
-  if (hostCaCert && fs.existsSync(hostCaCert)) {
-    const caCertDir = path.join(DATA_DIR, 'ca-cert');
-    const caCertDst = path.join(caCertDir, 'proxy-ca.crt');
-    fs.mkdirSync(caCertDir, { recursive: true });
-    fs.copyFileSync(hostCaCert, caCertDst);
-    mounts.push({
-      hostPath: caCertDir,
-      containerPath: '/workspace/ca-cert',
-      readonly: true,
-    });
-  }
-
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
-
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
-  }
-
-  // Runtime-specific args for host gateway resolution
-  args.push(...hostGatewayArgs());
-
-  // Run as host user so bind-mounted files are accessible.
-  // Skip when running as root (uid 0), as the container's node user (uid 1000),
-  // or when getuid is unavailable (native Windows without WSL).
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    if (isMain) {
-      // Main containers start as root so the entrypoint can mount --bind
-      // to shadow .env. Privileges are dropped via setpriv in entrypoint.sh.
-      args.push('-e', `RUN_UID=${hostUid}`);
-      args.push('-e', `RUN_GID=${hostGid}`);
-    } else {
-      args.push('--user', `${hostUid}:${hostGid}`);
-    }
-    args.push('-e', 'HOME=/home/node');
-  }
-
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-    }
-  }
-
-  args.push(CONTAINER_IMAGE);
-
-  return args;
-}
+// Kill log messages. container-watchdog.sh greps these to detect stuck-spawn
+// storms — keep the strings in sync with the script's patterns.
+const KILL_LOG_MESSAGES: Record<KillReason, string> = {
+  'first-output-timeout':
+    'No guest output before first-output timeout — killing wedged VM',
+  'startup-silence': 'No output for startup timeout — killing stuck container',
+  'hard-timeout': 'Container timeout, stopping gracefully',
+};
 
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
-  onOutput?: (output: ContainerOutput) => Promise<void>,
+  onOutput: (output: ContainerOutput) => Promise<void>,
+  options: RunAgentOptions = {},
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -410,6 +120,8 @@ export async function runContainerAgent(
   const inputFile = path.join(groupIpcDir, 'input', 'prompt.json');
   fs.writeFileSync(inputFile, JSON.stringify(input));
 
+  const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+
   return new Promise((resolve) => {
     const { cmd: spawnCmd, args: spawnArgs } = containerRunSpawn(containerArgs);
     const container = spawn(spawnCmd, spawnArgs, {
@@ -428,20 +140,57 @@ export async function runContainerAgent(
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
+    const lifecycle = new ContainerLifecycle({
+      firstOutputMs: FIRST_OUTPUT_TIMEOUT,
+      startupSilenceMs: CONTAINER_STARTUP_TIMEOUT,
+      hardTimeoutMs: configTimeout,
+      idleMs: options.idleMs ?? IDLE_TIMEOUT,
+      onKill: (reason) => {
+        logger.error(
+          { group: group.name, containerName, reason },
+          KILL_LOG_MESSAGES[reason],
+        );
+        try {
+          stopContainer(containerName);
+        } catch (err) {
+          logger.warn(
+            { group: group.name, containerName, err },
+            'Graceful stop failed',
+          );
+        }
+        // Always kill the spawned process to ensure the close event fires.
+        // Apple Container's `container stop` stops the VM but does not cause
+        // the `container run` client process to exit on its own.
+        container.kill('SIGKILL');
+        // Apple Container can leave the per-VM container-runtime-linux process
+        // alive after `container stop`. If those orphans accumulate, the
+        // apiserver wedges with XPC connection errors and every subsequent
+        // bootstrap fails. Reap this container's runtime after a short grace
+        // period so the next retry has a clean apiserver to talk to.
+        const reapTimer = setTimeout(() => {
+          try {
+            killRuntimeByUuid(containerName);
+          } catch (err) {
+            logger.warn(
+              { group: group.name, containerName, err },
+              'Post-timeout runtime reap failed',
+            );
+          }
+        }, 5_000);
+        reapTimer.unref();
+      },
+      onIdle: () => {
+        logger.debug(
+          { group: group.name, containerName },
+          'Idle timeout, requesting graceful container close',
+        );
+        options.onIdle?.();
+      },
+    });
+
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
-
-      // Any output means the container isn't silently wedged — keep the
-      // pre-result inactivity net alive so a long first turn isn't false-killed.
-      bumpStartupWatchdog();
-
-      // First guest output ("[agent-runner]" log line) proves the VM booted and
-      // the agent-runner process is alive — clears the fast first-output
-      // watchdog. (pty-merged runs surface these on stdout.)
-      if (!hadFirstOutput && chunk.includes('[agent-runner]')) {
-        hadFirstOutput = true;
-        clearTimeout(firstOutputWatchdog);
-      }
+      lifecycle.onOutput(chunk.includes(GUEST_OUTPUT_SIGNATURE));
 
       // Always accumulate for logging
       if (!stdoutTruncated) {
@@ -459,61 +208,47 @@ export async function runContainerAgent(
       }
 
       // Stream-parse for output markers
-      if (onOutput) {
-        parseBuffer += chunk;
-        let startIdx: number;
-        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
-          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
+      parseBuffer += chunk;
+      let startIdx: number;
+      while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+        const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+        if (endIdx === -1) break; // Incomplete pair, wait for more data
 
-          const jsonStr = parseBuffer
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+        const jsonStr = parseBuffer
+          .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+          .trim();
+        parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
 
-          try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
-            hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
-          } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
-            );
+        try {
+          const parsed: ContainerOutput = JSON.parse(jsonStr);
+          if (parsed.newSessionId) {
+            newSessionId = parsed.newSessionId;
           }
+          // The only event that resets the hard deadline (and arms idle).
+          lifecycle.onResult();
+          // Call onOutput for all markers (including null results)
+          // so idle timers start even for "silent" query completions.
+          outputChain = outputChain.then(() => onOutput(parsed));
+        } catch (err) {
+          logger.warn(
+            { group: group.name, error: err },
+            'Failed to parse streamed output chunk',
+          );
         }
       }
     });
 
     container.stderr.on('data', (data) => {
       const chunk = data.toString();
-
-      // SDK debug logs stream here continuously while the agent works — that's
-      // exactly the liveness signal the pre-result inactivity net needs, so
-      // bump it (unlike the hard timeout below, which stays result-only).
-      bumpStartupWatchdog();
-
-      // agent-runner logs via console.error (stderr); its first line is the
-      // earliest proof the guest is alive, so it also clears the watchdog.
-      if (!hadFirstOutput && chunk.includes('[agent-runner]')) {
-        hadFirstOutput = true;
-        clearTimeout(firstOutputWatchdog);
-      }
+      // SDK debug logs stream here continuously while the agent works —
+      // exactly the liveness signal the booting inactivity net needs. The
+      // hard deadline is unaffected (it only resets on result markers).
+      lifecycle.onOutput(chunk.includes(GUEST_OUTPUT_SIGNATURE));
 
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
       }
-      // Don't reset the hard timeout on stderr — SDK writes debug logs
-      // continuously. The hard timeout only resets on actual output
-      // (OUTPUT_MARKER in stdout via resetTimeout).
       if (stderrTruncated) return;
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
       if (chunk.length > remaining) {
@@ -528,119 +263,12 @@ export async function runContainerAgent(
       }
     });
 
-    let timedOut = false;
-    let hadStreamingOutput = false;
-    // Distinct from hadStreamingOutput (first *result marker*): this flips on
-    // the first *guest* output ("[agent-runner]" log line), which arrives long
-    // before any result. Drives the fast first-output watchdog below.
-    let hadFirstOutput = false;
-    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
-
-    const killOnTimeout = () => {
-      timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
-      );
-      try {
-        stopContainer(containerName);
-      } catch (err) {
-        logger.warn(
-          { group: group.name, containerName, err },
-          'Graceful stop failed',
-        );
-      }
-      // Always kill the spawned process to ensure the close event fires.
-      // Apple Container's `container stop` stops the VM but does not cause
-      // the `container run` client process to exit on its own.
-      container.kill('SIGKILL');
-      // Apple Container can leave the per-VM container-runtime-linux process
-      // alive after `container stop`. If those orphans accumulate, the
-      // apiserver wedges with XPC connection errors and every subsequent
-      // bootstrap fails. Reap this container's runtime after a short grace
-      // period so the next retry has a clean apiserver to talk to.
-      const reapTimer = setTimeout(() => {
-        try {
-          killRuntimeByUuid(containerName);
-        } catch (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Post-timeout runtime reap failed',
-          );
-        }
-      }, 5_000);
-      reapTimer.unref();
-    };
-
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
-
-    // Pre-result inactivity net. A healthy agent streams continuous output
-    // (SDK debug logs on stderr, IPC/tool activity) while it works toward its
-    // first result — even a long multi-step first turn is never silent for
-    // long. A wedged VM, or a hung session-transcript resume, by contrast goes
-    // completely silent after the "[agent-runner]" preamble. So rather than a
-    // fixed deadline — which false-kills a legitimately long first turn — kill
-    // only after CONTAINER_STARTUP_TIMEOUT of *no output at all*. Re-armed on
-    // every guest output by bumpStartupWatchdog(); cleared for good once the
-    // first result marker arrives (resetTimeout), so it cannot fire during the
-    // post-result idle keep-alive.
-    const killOnStartupSilence = () => {
-      logger.error(
-        { group: group.name, containerName, ms: CONTAINER_STARTUP_TIMEOUT },
-        'No output for startup timeout — killing stuck container',
-      );
-      killOnTimeout();
-    };
-    let startupWatchdog = setTimeout(
-      killOnStartupSilence,
-      CONTAINER_STARTUP_TIMEOUT,
-    );
-    const bumpStartupWatchdog = () => {
-      // Only meaningful before the first result; afterward the hard/idle
-      // timeouts govern and resetTimeout has cleared this net for good.
-      if (hadStreamingOutput) return;
-      clearTimeout(startupWatchdog);
-      startupWatchdog = setTimeout(
-        killOnStartupSilence,
-        CONTAINER_STARTUP_TIMEOUT,
-      );
-    };
-
-    // Earlier, cheaper net for the most common failure: a half-dead VM that
-    // boots, prints only host-side progress bars, and never starts the guest
-    // agent-runner at all. A healthy VM emits its first "[agent-runner]" line
-    // within ~3-5s, so if we've seen no guest output within FIRST_OUTPUT_TIMEOUT
-    // the VM is wedged — kill it ~6x faster than the result-marker watchdog
-    // above. Kept separate so a healthy-but-slow first turn (which may take 30s+
-    // to produce its first result) is not false-killed.
-    const firstOutputWatchdog = setTimeout(() => {
-      if (!hadFirstOutput) {
-        logger.error(
-          { group: group.name, containerName, ms: FIRST_OUTPUT_TIMEOUT },
-          'No guest output before first-output timeout — killing wedged VM',
-        );
-        killOnTimeout();
-      }
-    }, FIRST_OUTPUT_TIMEOUT);
-
-    // Reset the timeout whenever there's activity (streaming output)
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      clearTimeout(startupWatchdog);
-      clearTimeout(firstOutputWatchdog);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
-    };
-
     container.on('close', (code) => {
-      clearTimeout(timeout);
-      clearTimeout(startupWatchdog);
-      clearTimeout(firstOutputWatchdog);
+      const killed = lifecycle.killReason !== null;
+      lifecycle.dispose();
       const duration = Date.now() - startTime;
 
-      if (timedOut) {
+      if (killed) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
         fs.writeFileSync(
@@ -652,14 +280,15 @@ export async function runContainerAgent(
             `Container: ${containerName}`,
             `Duration: ${duration}ms`,
             `Exit Code: ${code}`,
-            `Had Streaming Output: ${hadStreamingOutput}`,
+            `Kill Reason: ${lifecycle.killReason}`,
+            `Had Result: ${lifecycle.hadResult}`,
           ].join('\n'),
         );
 
         // Timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
         // container being reaped after the idle period expired.
-        if (hadStreamingOutput) {
+        if (lifecycle.hadResult) {
           logger.info(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
@@ -683,14 +312,20 @@ export async function runContainerAgent(
         }
 
         logger.error(
-          { group: group.name, containerName, duration, code },
+          {
+            group: group.name,
+            containerName,
+            duration,
+            code,
+            reason: lifecycle.killReason,
+          },
           'Container timed out with no output',
         );
 
         resolve({
           status: 'error',
           result: null,
-          error: `Container timed out after ${configTimeout}ms`,
+          error: `Container timed out after ${configTimeout}ms (${lifecycle.killReason})`,
         });
         return;
       }
@@ -784,82 +419,30 @@ export async function runContainerAgent(
         return;
       }
 
-      // Streaming mode: wait for output chain to settle, return completion marker
-      if (onOutput) {
-        outputChain
-          .then(() => {
-            logger.info(
-              { group: group.name, duration, newSessionId },
-              'Container completed (streaming mode)',
-            );
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
-            });
-          })
-          .catch((err) => {
-            logger.error(
-              { group: group.name, containerName, err },
-              'Output chain error — releasing queue lock',
-            );
-            resolve({ status: 'error', result: null, error: String(err) });
+      // Wait for the output chain to settle, then return a completion marker.
+      outputChain
+        .then(() => {
+          logger.info(
+            { group: group.name, duration, newSessionId },
+            'Container completed (streaming mode)',
+          );
+          resolve({
+            status: 'success',
+            result: null,
+            newSessionId,
           });
-        return;
-      }
-
-      // Legacy mode: parse the last output marker pair from accumulated stdout
-      try {
-        // Extract JSON between sentinel markers for robust parsing
-        const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
-
-        let jsonLine: string;
-        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-          jsonLine = stdout
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-        } else {
-          // Fallback: last non-empty line (backwards compatibility)
-          const lines = stdout.trim().split('\n');
-          jsonLine = lines[lines.length - 1];
-        }
-
-        const output: ContainerOutput = JSON.parse(jsonLine);
-
-        logger.info(
-          {
-            group: group.name,
-            duration,
-            status: output.status,
-            hasResult: !!output.result,
-          },
-          'Container completed',
-        );
-
-        resolve(output);
-      } catch (err) {
-        logger.error(
-          {
-            group: group.name,
-            stdout,
-            stderr,
-            error: err,
-          },
-          'Failed to parse container output',
-        );
-
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Failed to parse container output: ${err instanceof Error ? err.message : String(err)}`,
+        })
+        .catch((err) => {
+          logger.error(
+            { group: group.name, containerName, err },
+            'Output chain error — releasing queue lock',
+          );
+          resolve({ status: 'error', result: null, error: String(err) });
         });
-      }
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
-      clearTimeout(startupWatchdog);
+      lifecycle.dispose();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

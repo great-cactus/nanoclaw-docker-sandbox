@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, ProcessOutcome } from './group-queue.js';
+
+const OK: ProcessOutcome = { kind: 'ok' };
+const failed = (
+  delivered = false,
+  rollback: () => void = () => {},
+): ProcessOutcome => ({ kind: 'failed', delivered, rollback });
 
 // Mock config to control concurrency limit
 vi.mock('./config.js', () => ({
@@ -47,7 +53,7 @@ describe('GroupQueue', () => {
       // Simulate async work
       await new Promise((resolve) => setTimeout(resolve, 100));
       concurrentCount--;
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -75,7 +81,7 @@ describe('GroupQueue', () => {
       maxActive = Math.max(maxActive, activeCount);
       await new Promise<void>((resolve) => completionCallbacks.push(resolve));
       activeCount--;
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -113,7 +119,7 @@ describe('GroupQueue', () => {
         });
       }
       executionOrder.push('messages');
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -146,7 +152,7 @@ describe('GroupQueue', () => {
 
     const processMessages = vi.fn(async () => {
       callCount++;
-      return false; // failure
+      return failed(); // failure
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -170,7 +176,7 @@ describe('GroupQueue', () => {
   // --- Shutdown prevents new enqueues ---
 
   it('prevents new enqueues after shutdown', async () => {
-    const processMessages = vi.fn(async () => true);
+    const processMessages = vi.fn(async () => OK);
     queue.setProcessMessagesFn(processMessages);
 
     await queue.shutdown(1000);
@@ -188,7 +194,7 @@ describe('GroupQueue', () => {
 
     const processMessages = vi.fn(async () => {
       callCount++;
-      return false; // always fail
+      return failed(); // always fail
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -212,6 +218,50 @@ describe('GroupQueue', () => {
     expect(callCount).toBe(countAfterMaxRetries);
   });
 
+  // --- Delivered failures are never retried (duplicate prevention) ---
+
+  it('does not retry a failed run whose output already reached the user', async () => {
+    const rollback = vi.fn();
+    const processMessages = vi.fn(async () => failed(true, rollback));
+
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(processMessages).toHaveBeenCalledTimes(1);
+
+    // No retry is ever scheduled, and the cursor is never rolled back
+    await vi.advanceTimersByTimeAsync(200000);
+    expect(processMessages).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
+  // --- Rollback only happens when a retry is actually scheduled ---
+
+  it('rolls back the cursor on each retryable failure but not on the final one', async () => {
+    const rollbacks: number[] = [];
+    let callCount = 0;
+
+    const processMessages = vi.fn(async () => {
+      callCount++;
+      const attempt = callCount;
+      return failed(false, () => rollbacks.push(attempt));
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+
+    // Initial + 5 retries
+    await vi.advanceTimersByTimeAsync(10);
+    for (const delay of [5000, 10000, 20000, 40000, 80000]) {
+      await vi.advanceTimersByTimeAsync(delay + 10);
+    }
+    expect(callCount).toBe(6);
+    // Attempts 1-5 rolled back (each preceding a retry); the final 6th did
+    // not — its cursor stays advanced so recovery can't restart the cycle.
+    expect(rollbacks).toEqual([1, 2, 3, 4, 5]);
+  });
+
   // --- Waiting groups get drained when slots free up ---
 
   it('drains waiting groups when active slots free up', async () => {
@@ -221,7 +271,7 @@ describe('GroupQueue', () => {
     const processMessages = vi.fn(async (groupJid: string) => {
       processed.push(groupJid);
       await new Promise<void>((resolve) => completionCallbacks.push(resolve));
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -289,7 +339,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -329,7 +379,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -372,7 +422,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -442,7 +492,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return OK;
     });
 
     queue.setProcessMessagesFn(processMessages);

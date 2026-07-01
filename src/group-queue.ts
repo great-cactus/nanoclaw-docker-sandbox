@@ -15,6 +15,23 @@ interface QueuedTask {
   fn: () => Promise<void>;
 }
 
+/**
+ * Result of one message-processing run. The processor reports facts; the
+ * queue owns the retry policy (backoff, attempt cap, when to roll back).
+ *
+ * - `delivered`: output already reached the user during this run (via the
+ *   result marker or an agent-initiated IPC send). A delivered run is never
+ *   retried — re-running the task would send duplicates.
+ * - `rollback`: undoes the processor's optimistic cursor advance so a retry
+ *   re-reads the same messages. Called by the queue only when it actually
+ *   schedules a retry; on final failure the cursor stays advanced so the
+ *   poll/recovery path doesn't re-detect the messages and restart the cycle
+ *   (the runaway container-spawn loop).
+ */
+export type ProcessOutcome =
+  | { kind: 'ok' }
+  | { kind: 'failed'; delivered: boolean; rollback: () => void };
+
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
@@ -36,7 +53,7 @@ export class GroupQueue {
   private activeCount = 0;
   private waitingGroups: string[] = [];
   private processMessagesFn:
-    | ((groupJid: string, isFinalAttempt: boolean) => Promise<boolean>)
+    | ((groupJid: string) => Promise<ProcessOutcome>)
     | null = null;
   private shuttingDown = false;
   /**
@@ -82,7 +99,7 @@ export class GroupQueue {
   }
 
   setProcessMessagesFn(
-    fn: (groupJid: string, isFinalAttempt: boolean) => Promise<boolean>,
+    fn: (groupJid: string) => Promise<ProcessOutcome>,
   ): void {
     this.processMessagesFn = fn;
   }
@@ -241,19 +258,12 @@ export class GroupQueue {
 
     try {
       if (this.processMessagesFn) {
-        // On the final permitted attempt, tell the processor not to roll the
-        // cursor back on a no-output failure. Otherwise the dropped messages
-        // stay "unprocessed" and the poll/recovery re-detects them, restarting
-        // the whole retry cycle — an unbounded container-spawn loop.
-        const isFinalAttempt = state.retryCount >= MAX_RETRIES;
-        const success = await this.processMessagesFn(groupJid, isFinalAttempt);
-        if (success) {
-          state.retryCount = 0;
-        } else {
-          this.scheduleRetry(groupJid, state);
-        }
+        const outcome = await this.processMessagesFn(groupJid);
+        this.handleOutcome(groupJid, state, outcome);
       }
     } catch (err) {
+      // Processor threw before it could report facts. No rollback is
+      // available, so just schedule a retry (matches historic behavior).
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
@@ -295,6 +305,43 @@ export class GroupQueue {
       this.activeCount--;
       this.drainGroup(groupJid);
     }
+  }
+
+  /**
+   * Single home of the retry policy: a delivered run is never retried, a
+   * final failure drops the messages without rolling the cursor back, and
+   * everything else rolls back and retries with backoff.
+   */
+  private handleOutcome(
+    groupJid: string,
+    state: GroupState,
+    outcome: ProcessOutcome,
+  ): void {
+    if (outcome.kind === 'ok') {
+      state.retryCount = 0;
+      return;
+    }
+
+    if (outcome.delivered) {
+      logger.warn(
+        { groupJid },
+        'Run failed after output reached the user — not retrying to prevent duplicates',
+      );
+      state.retryCount = 0;
+      return;
+    }
+
+    if (state.retryCount >= MAX_RETRIES) {
+      logger.error(
+        { groupJid, retryCount: state.retryCount },
+        'Max retries exceeded, dropping messages (cursor stays advanced; will retry on next incoming message)',
+      );
+      state.retryCount = 0;
+      return;
+    }
+
+    outcome.rollback();
+    this.scheduleRetry(groupJid, state);
   }
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
