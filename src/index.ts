@@ -70,6 +70,11 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+// Per-JID count of agent-initiated IPC sends. Agents reply via IPC (not the
+// result marker), so this is how processGroupMessages tells that a run already
+// delivered output to the user and must not roll back / retry (which would
+// re-run the task and duplicate messages).
+const ipcSendCounts: Record<string, number> = {};
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -191,6 +196,9 @@ async function processGroupMessages(
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
+  // Baseline of IPC deliveries; if it grows during the run, the agent replied
+  // via IPC and we must not roll back / retry (would duplicate the work).
+  const ipcCountBefore = ipcSendCounts[chatJid] ?? 0;
   lastAgentTimestamp[chatJid] =
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
@@ -249,11 +257,14 @@ async function processGroupMessages(
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+    // If output already reached the user — via the result marker OR via an
+    // agent-initiated IPC send during this run — don't roll back the cursor.
+    // The user got their response and re-processing would re-run the task and
+    // send duplicates.
+    const ipcSentDuringRun = (ipcSendCounts[chatJid] ?? 0) > ipcCountBefore;
+    if (outputSentToUser || ipcSentDuringRun) {
       logger.warn(
-        { group: group.name },
+        { group: group.name, ipcSentDuringRun },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
       return true;
@@ -665,10 +676,12 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      await channel.sendMessage(jid, text);
+      // Record delivery so an agent that already replied via IPC isn't retried.
+      ipcSendCounts[jid] = (ipcSendCounts[jid] ?? 0) + 1;
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
