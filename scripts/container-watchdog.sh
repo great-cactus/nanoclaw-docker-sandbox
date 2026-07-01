@@ -117,8 +117,10 @@ is_stuck() {
   last_success_line=$(grep -nE "Container completed|Container timed out after output|Agent output" <<< "$slice" | tail -1 | cut -d: -f1)
   : "${last_success_line:=0}"
 
+  # Startup-kill messages emitted by container-runner.ts (KILL_LOG_MESSAGES) —
+  # keep these patterns in sync with that map.
   timeouts_after=$(tail -n +"$((last_success_line + 1))" <<< "$slice" \
-    | grep -c "No output before startup timeout")
+    | grep -cE "No output for startup timeout|No guest output before first-output timeout")
 
   [ "$timeouts_after" -ge "$TIMEOUT_THRESHOLD" ]
 }
