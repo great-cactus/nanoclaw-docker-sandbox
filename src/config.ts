@@ -82,9 +82,14 @@ export const CONTAINER_TIMEOUT = parseInt(
  * occasionally drops a VM into a half-dead state where the wrapper hangs
  * indefinitely; without this watchdog the queue would block on it for the
  * full CONTAINER_TIMEOUT (30 min default).
+ *
+ * 5 min, not shorter: a single long tool-call generation (e.g. transcribing a
+ * full document into one Write) can legitimately stream nothing host-visible
+ * for well over 2 min, and 120s false-killed healthy agents mid-work. Boot
+ * wedges don't wait on this — FIRST_OUTPUT_TIMEOUT (20s) catches those.
  */
 export const CONTAINER_STARTUP_TIMEOUT = parseInt(
-  process.env.CONTAINER_STARTUP_TIMEOUT || '120000',
+  process.env.CONTAINER_STARTUP_TIMEOUT || '300000',
   10,
 );
 /**
