@@ -56,3 +56,12 @@ NEVER use markdown. Only use WhatsApp/Telegram formatting:
 - ```triple backticks``` for code
 
 No ## headings. No [links](url). No **double stars**.
+
+
+## トークン節約(必須方針)
+
+メインの会話コンテキストは高価なモデルで動いている。以下を常に守ること:
+
+1. **かさばる読み込みは scribe に委譲する。** ファイル全文・PDF・Webページ・ログなど大量テキストの読み込み/転記/変換/要約は、自分で読まずに Task ツールで `scribe` サブエージェント(Haiku)に任せ、要約か出力ファイルパスだけ受け取る。
+2. **テキストの移動にモデルを使わない。** 転記・連結・抽出は `pdftotext`、`cat a >> b`、`grep`、`sed` 等のシェルで行い、本文をコンテキストに通さない。
+3. **大きなツール出力を避ける。** `head`/`tail`/`grep` で必要な部分だけ読む。全文 `cat` は原則禁止。

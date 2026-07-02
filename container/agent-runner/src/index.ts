@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -393,6 +394,9 @@ async function runQuery(
     prompt: stream,
     options: {
       cwd: '/workspace/group',
+      // Per-group model override (registered_groups.container_config.model);
+      // undefined falls through to the SDK default.
+      model: containerInput.model || undefined,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,

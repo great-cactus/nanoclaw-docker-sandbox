@@ -134,6 +134,21 @@ export function buildVolumeMounts(
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+
+  // Sync subagent definitions from container/agents/ into each group's
+  // .claude/agents/ (e.g. the Haiku "scribe" for cheap mechanical work)
+  const agentsSrc = path.join(process.cwd(), 'container', 'agents');
+  const agentsDst = path.join(groupSessionsDir, 'agents');
+  if (fs.existsSync(agentsSrc)) {
+    fs.mkdirSync(agentsDst, { recursive: true });
+    for (const agentFile of fs.readdirSync(agentsSrc)) {
+      if (!agentFile.endsWith('.md')) continue;
+      fs.copyFileSync(
+        path.join(agentsSrc, agentFile),
+        path.join(agentsDst, agentFile),
+      );
+    }
+  }
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
