@@ -34,6 +34,7 @@ export interface VolumeMount {
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  ipcFolder: string = group.folder,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -166,9 +167,11 @@ export function buildVolumeMounts(
     });
   }
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  // Per-conversation IPC namespace: each group — and each forum topic within
+  // a group — gets its own IPC directory. This prevents cross-group privilege
+  // escalation via IPC, and keeps concurrent topic containers of the same
+  // group from consuming each other's input files and close sentinels.
+  const groupIpcDir = resolveGroupIpcPath(ipcFolder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });

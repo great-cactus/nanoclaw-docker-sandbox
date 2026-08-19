@@ -48,6 +48,12 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
+import {
+  convIpcFolder,
+  convSessionKey,
+  makeConvKey,
+  splitConvKey,
+} from './conversation.js';
 import { GroupQueue, ProcessOutcome } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
@@ -151,11 +157,13 @@ export function _setRegisteredGroups(
 }
 
 /**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn. Reports facts
- * (delivered/failed) back to the queue, which owns the retry policy.
+ * Process all pending messages for a conversation (a chat, or one forum
+ * topic within a chat). Called by the GroupQueue when it's this
+ * conversation's turn. Reports facts (delivered/failed) back to the queue,
+ * which owns the retry policy.
  */
-async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
+async function processGroupMessages(convKey: string): Promise<ProcessOutcome> {
+  const { chatJid, threadId } = splitConvKey(convKey);
   // Re-read from DB each time so container_config changes (e.g. mount path fixes)
   // take effect without requiring a sentinel restart.
   const group = getRegisteredGroup(chatJid) ?? registeredGroups[chatJid];
@@ -169,11 +177,13 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  const sinceTimestamp = lastAgentTimestamp[convKey] || '';
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
+    undefined,
+    threadId ?? null,
   );
 
   if (missedMessages.length === 0) return { kind: 'ok' };
@@ -191,17 +201,13 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // Determine the thread_id from the most recent message for reply routing.
-  // In Telegram forum groups, responses should go to the same topic thread.
-  const replyThreadId = missedMessages[missedMessages.length - 1]?.thread_id;
-
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
+  const previousCursor = lastAgentTimestamp[convKey] || '';
   // Baseline of IPC deliveries; if it grows during the run, the agent replied
   // via IPC and we must not roll back / retry (would duplicate the work).
-  const ipcCountBefore = ipcSendCounts[chatJid] ?? 0;
-  lastAgentTimestamp[chatJid] =
+  const ipcCountBefore = ipcSendCounts[convKey] ?? 0;
+  lastAgentTimestamp[convKey] =
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
 
@@ -209,7 +215,7 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
     {
       group: group.name,
       messageCount: missedMessages.length,
-      threadId: replyThreadId,
+      threadId,
     },
     'Processing messages',
   );
@@ -221,7 +227,7 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
   const output = await runAgent(
     group,
     prompt,
-    chatJid,
+    convKey,
     async (result) => {
       // Streaming output callback — called for each agent result
       if (result.result) {
@@ -236,13 +242,13 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(chatJid, text, replyThreadId);
+          await channel.sendMessage(chatJid, text, threadId);
           outputSentToUser = true;
         }
       }
 
       if (result.status === 'success') {
-        queue.notifyIdle(chatJid);
+        queue.notifyIdle(convKey);
       }
 
       if (result.status === 'error') {
@@ -251,7 +257,7 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
     },
     {
       idleMs: IDLE_TIMEOUT,
-      onIdle: () => queue.closeStdin(chatJid),
+      onIdle: () => queue.closeStdin(convKey),
     },
   );
 
@@ -261,12 +267,12 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
     // Report facts to the queue; it decides whether to retry. "Delivered"
     // covers both the result marker and agent-initiated IPC sends during
     // this run — either way the user already got a response.
-    const ipcSentDuringRun = (ipcSendCounts[chatJid] ?? 0) > ipcCountBefore;
+    const ipcSentDuringRun = (ipcSendCounts[convKey] ?? 0) > ipcCountBefore;
     return {
       kind: 'failed',
       delivered: outputSentToUser || ipcSentDuringRun,
       rollback: () => {
-        lastAgentTimestamp[chatJid] = previousCursor;
+        lastAgentTimestamp[convKey] = previousCursor;
         saveState();
         logger.warn(
           { group: group.name },
@@ -304,10 +310,15 @@ function sessionTranscriptPath(groupFolder: string, sessionId: string): string {
  * Done in-process (memory map + DB) so it takes effect without a restart. The
  * group's durable memory lives in its CLAUDE.md and is untouched.
  */
-function rotateSessionIfBloated(group: RegisteredGroup): void {
-  const sessionId = sessions[group.folder];
+function rotateSessionIfBloated(
+  group: RegisteredGroup,
+  sessionKey: string,
+): void {
+  const sessionId = sessions[sessionKey];
   if (!sessionId) return;
 
+  // The transcript lives under the group's (shared) sessions dir regardless
+  // of which topic conversation owns the session.
   const transcript = sessionTranscriptPath(group.folder, sessionId);
   let size: number;
   try {
@@ -323,11 +334,11 @@ function rotateSessionIfBloated(group: RegisteredGroup): void {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dest = path.join(
       archiveDir,
-      `${group.folder}-${sessionId}-${stamp}.jsonl`,
+      `${sessionKey}-${sessionId}-${stamp}.jsonl`,
     );
     fs.renameSync(transcript, dest);
-    delete sessions[group.folder];
-    clearSession(group.folder);
+    delete sessions[sessionKey];
+    clearSession(sessionKey);
     logger.warn(
       {
         group: group.name,
@@ -348,18 +359,23 @@ function rotateSessionIfBloated(group: RegisteredGroup): void {
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
-  chatJid: string,
+  convKey: string,
   onOutput: (output: ContainerOutput) => Promise<void>,
   options?: import('./container-runner.js').RunAgentOptions,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  rotateSessionIfBloated(group);
-  const sessionId = sessions[group.folder];
+  const { threadId } = splitConvKey(convKey);
+  // Topic conversations get their own session (isolated context) and IPC
+  // namespace (isolated input files), but share the group folder (memory).
+  const sessionKey = convSessionKey(group.folder, threadId);
+  const ipcFolder = convIpcFolder(group.folder, threadId);
+  rotateSessionIfBloated(group, sessionKey);
+  const sessionId = sessions[sessionKey];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
   writeTasksSnapshot(
-    group.folder,
+    ipcFolder,
     isMain,
     tasks.map((t) => ({
       id: t.id,
@@ -375,7 +391,7 @@ async function runAgent(
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
-    group.folder,
+    ipcFolder,
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
@@ -384,8 +400,8 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = async (output: ContainerOutput) => {
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sessionKey] = output.newSessionId;
+      setSession(sessionKey, output.newSessionId);
     }
     await onOutput(output);
   };
@@ -397,20 +413,21 @@ async function runAgent(
         prompt,
         sessionId,
         groupFolder: group.folder,
-        chatJid,
+        chatJid: convKey,
         isMain,
         assistantName: ASSISTANT_NAME,
         model: group.containerConfig?.model,
+        ipcFolder,
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(convKey, proc, containerName, ipcFolder),
       wrappedOnOutput,
       options,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sessionKey] = output.newSessionId;
+      setSession(sessionKey, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -453,18 +470,20 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        // Deduplicate by conversation (chat, or forum topic within a chat)
+        const messagesByConv = new Map<string, NewMessage[]>();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
+          const convKey = makeConvKey(msg.chat_jid, msg.thread_id);
+          const existing = messagesByConv.get(convKey);
           if (existing) {
             existing.push(msg);
           } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
+            messagesByConv.set(convKey, [msg]);
           }
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
+        for (const [convKey, convMessages] of messagesByConv) {
+          const { chatJid, threadId } = splitConvKey(convKey);
           const group = registeredGroups[chatJid];
           if (!group) continue;
 
@@ -482,21 +501,23 @@ async function startMessageLoop(): Promise<void> {
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
             chatJid,
-            lastAgentTimestamp[chatJid] || '',
+            lastAgentTimestamp[convKey] || '',
             ASSISTANT_NAME,
+            undefined,
+            threadId ?? null,
           );
           const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
+            allPending.length > 0 ? allPending : convMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          // If a container is already active for this group, pipe the message
-          // directly regardless of trigger — the conversation is already open.
-          if (queue.sendMessage(chatJid, formatted)) {
+          // If a container is already active for this conversation, pipe the
+          // message directly regardless of trigger — it's already open.
+          if (queue.sendMessage(convKey, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { convKey, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
+            lastAgentTimestamp[convKey] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
@@ -509,7 +530,7 @@ async function startMessageLoop(): Promise<void> {
             // No active container — check trigger before launching a new one
             if (needsTrigger) {
               const allowlistCfg = loadSenderAllowlist();
-              const hasTrigger = groupMessages.some(
+              const hasTrigger = convMessages.some(
                 (m) =>
                   TRIGGER_PATTERN.test(m.content.trim()) &&
                   (m.is_from_me ||
@@ -517,7 +538,7 @@ async function startMessageLoop(): Promise<void> {
               );
               if (!hasTrigger) continue;
             }
-            queue.enqueueMessageCheck(chatJid);
+            queue.enqueueMessageCheck(convKey);
           }
         }
       }
@@ -534,14 +555,30 @@ async function startMessageLoop(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+    // Conversations of this chat may have diverging cursors (one per forum
+    // topic). Fetch from the earliest cursor, then re-check each
+    // conversation's bucket against its own cursor.
+    const convCursors = Object.entries(lastAgentTimestamp)
+      .filter(([key]) => splitConvKey(key).chatJid === chatJid)
+      .map(([, ts]) => ts)
+      .sort();
+    const sinceTimestamp = convCursors[0] ?? '';
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
+    if (pending.length === 0) continue;
+
+    const pendingConvKeys = new Set<string>();
+    for (const msg of pending) {
+      const convKey = makeConvKey(msg.chat_jid, msg.thread_id);
+      if (msg.timestamp > (lastAgentTimestamp[convKey] || '')) {
+        pendingConvKeys.add(convKey);
+      }
+    }
+    for (const convKey of pendingConvKeys) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: group.name, convKey, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
       );
-      queue.enqueueMessageCheck(chatJid);
+      queue.enqueueMessageCheck(convKey);
     }
   }
 }
@@ -664,9 +701,12 @@ async function main(): Promise<void> {
   });
   startIpcWatcher({
     sendMessage: async (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      await channel.sendMessage(jid, text);
+      // Agents in topic conversations reply with their conversation key
+      // (chatJid#threadId) — split it so the reply lands in the topic.
+      const { chatJid, threadId } = splitConvKey(jid);
+      const channel = findChannel(channels, chatJid);
+      if (!channel) throw new Error(`No channel for JID: ${chatJid}`);
+      await channel.sendMessage(chatJid, text, threadId);
       // Record delivery so an agent that already replied via IPC isn't retried.
       ipcSendCounts[jid] = (ipcSendCounts[jid] ?? 0) + 1;
     },

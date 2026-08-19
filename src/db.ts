@@ -353,7 +353,16 @@ export function getMessagesSince(
   sinceTimestamp: string,
   botPrefix: string,
   limit: number = 200,
+  threadId?: string | null,
 ): NewMessage[] {
+  // threadId narrows to one conversation: a string matches that topic,
+  // null matches only non-topic messages, undefined disables the filter.
+  const threadClause =
+    threadId === undefined
+      ? ''
+      : threadId === null
+        ? 'AND thread_id IS NULL'
+        : 'AND thread_id = ?';
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
@@ -364,13 +373,19 @@ export function getMessagesSince(
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
+        ${threadClause}
       ORDER BY timestamp DESC
       LIMIT ?
     ) ORDER BY timestamp
   `;
-  return db
-    .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+  const params: (string | number)[] = [
+    chatJid,
+    sinceTimestamp,
+    `${botPrefix}:%`,
+  ];
+  if (typeof threadId === 'string') params.push(threadId);
+  params.push(limit);
+  return db.prepare(sql).all(...params) as NewMessage[];
 }
 
 export function createTask(

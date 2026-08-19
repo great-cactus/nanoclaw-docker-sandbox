@@ -24,6 +24,7 @@ import {
   killRuntimeByUuid,
   stopContainer,
 } from './container-runtime.js';
+import { ipcFolderToGroupFolder } from './conversation.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -46,6 +47,12 @@ export interface ContainerInput {
   assistantName?: string;
   script?: string;
   model?: string;
+  /**
+   * IPC namespace directory (defaults to groupFolder). Forum-topic
+   * conversations use a per-topic namespace so parallel containers of the
+   * same group don't share input files.
+   */
+  ipcFolder?: string;
 }
 
 export interface ContainerOutput {
@@ -83,8 +90,9 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
-  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const ipcFolder = input.ipcFolder ?? group.folder;
+  const mounts = buildVolumeMounts(group, input.isMain, ipcFolder);
+  const safeName = ipcFolder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName, input.isMain);
 
@@ -117,7 +125,7 @@ export async function runContainerAgent(
   // Write input to a file in the IPC directory so the container can read it
   // without needing stdin piping (Apple Container crashes with SIGTRAP when
   // spawned from Node.js with piped stdio and -i flag).
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const groupIpcDir = resolveGroupIpcPath(ipcFolder);
   const inputFile = path.join(groupIpcDir, 'input', 'prompt.json');
   fs.writeFileSync(inputFile, JSON.stringify(input));
 
@@ -471,14 +479,16 @@ export function writeTasksSnapshot(
     next_run: string | null;
   }>,
 ): void {
-  // Write filtered tasks to the group's IPC directory
+  // Write filtered tasks to the conversation's IPC directory. Topic
+  // namespaces (folder--tN) see the owning group's tasks.
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
+  const ownerFolder = ipcFolderToGroupFolder(groupFolder);
   // Main sees all tasks, others only see their own
   const filteredTasks = isMain
     ? tasks
-    : tasks.filter((t) => t.groupFolder === groupFolder);
+    : tasks.filter((t) => t.groupFolder === ownerFolder);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
