@@ -188,6 +188,27 @@ export async function ensureBridgeSentinel(image: string): Promise<void> {
     logger.debug('bridge100 already up — skipping sentinel');
     return;
   }
+  // After an unclean shutdown (host reboot, power loss) the sentinel's `--rm`
+  // cleanup never ran, so its record survives in the runtime's state and
+  // `container run --name` fails instantly with "already exists". bridge100
+  // being down means no container is actually running, so any record under
+  // this name is stale — remove it or the spawn below silently fails and
+  // startup crash-loops until something else prunes the record.
+  try {
+    execSync(
+      `${CONTAINER_RUNTIME_BIN} delete --force ${BRIDGE_SENTINEL_NAME}`,
+      {
+        stdio: 'pipe',
+        timeout: COMMAND_TIMEOUT_MS,
+      },
+    );
+    logger.info(
+      { name: BRIDGE_SENTINEL_NAME },
+      'Removed stale bridge sentinel record',
+    );
+  } catch {
+    /* no stale record to remove */
+  }
   logger.info({ name: BRIDGE_SENTINEL_NAME }, 'Spawning bridge sentinel');
   const child = spawn(
     'script',
