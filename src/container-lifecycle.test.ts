@@ -77,16 +77,48 @@ describe('ContainerLifecycle', () => {
     expect(lc.currentPhase).toBe('booting');
   });
 
-  it('continuous output without any result still dies at the hard deadline', () => {
+  it('continuous activity without any result dies at the lifetime cap, not the hard deadline', () => {
     const { lc, kills } = createLifecycle();
     lc.onOutput(true);
+    // Effective hard = max(hard, idle+grace); lifetime cap defaults to 3×.
+    const effectiveHard = Math.max(HARD_TIMEOUT_MS, IDLE_MS + GRACE_MS);
+    const maxLifetime = effectiveHard * 3;
+    const steps = Math.ceil(maxLifetime / 60_000) + 1;
+    for (let i = 0; i < steps; i++) {
+      vi.advanceTimersByTime(60_000);
+      lc.onOutput(true); // activity keeps stretching the hard deadline
+    }
+    expect(kills).toEqual(['max-lifetime']);
+    expect(lc.hadResult).toBe(false);
+  });
+
+  it('heartbeat-only output does not stretch the hard deadline', () => {
+    const { lc, kills } = createLifecycle();
+    lc.onOutput(true); // first guest output → booting
+    lc.onResult(); // → responding, hard deadline re-armed
     const steps = Math.ceil(HARD_TIMEOUT_MS / 60_000) + 1;
     for (let i = 0; i < steps; i++) {
       vi.advanceTimersByTime(60_000);
-      lc.onOutput(false);
+      lc.onOutput(true, false); // heartbeat: alive but no progress
     }
     expect(kills).toEqual(['hard-timeout']);
-    expect(lc.hadResult).toBe(false);
+  });
+
+  it('activity stretches the idle deadline so a busy agent is not wound down', () => {
+    const { lc, idles } = createLifecycle({ idleMs: 600_000 });
+    lc.onOutput(true);
+    lc.onResult();
+    // Active tool-looping for 3× the idle window — never idle.
+    for (let i = 0; i < 6; i++) {
+      vi.advanceTimersByTime(300_000);
+      lc.onOutput(true, true);
+    }
+    expect(idles).toHaveLength(0);
+    // Real quiet (heartbeat only) → idle fires after idleMs.
+    vi.advanceTimersByTime(300_000);
+    lc.onOutput(true, false);
+    vi.advanceTimersByTime(300_000);
+    expect(idles).toHaveLength(1);
   });
 
   it('a result moves to responding and re-arms the hard deadline', () => {

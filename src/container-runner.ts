@@ -37,6 +37,32 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 // booted and the guest process is alive (host-side runtime noise doesn't).
 const GUEST_OUTPUT_SIGNATURE = '[agent-runner]';
 
+// Keepalive heartbeat emitted by agent-runner during long quiet tool calls.
+// Proves the process is alive but NOT that the agent is making progress, so
+// it must not stretch the stall/idle deadlines (must match agent-runner's
+// heartbeat log line).
+const HEARTBEAT_SIGNATURE = '[agent-runner] heartbeat';
+
+/**
+ * Classify an output chunk for the lifecycle: guest output proves liveness;
+ * guest output other than the heartbeat proves activity (progress).
+ */
+function classifyOutput(chunk: string): {
+  isGuest: boolean;
+  isActivity: boolean;
+} {
+  const isGuest = chunk.includes(GUEST_OUTPUT_SIGNATURE);
+  if (!isGuest) return { isGuest: false, isActivity: false };
+  const withoutHeartbeats = chunk
+    .split('\n')
+    .filter((line) => !line.includes(HEARTBEAT_SIGNATURE))
+    .join('\n');
+  return {
+    isGuest: true,
+    isActivity: withoutHeartbeats.includes(GUEST_OUTPUT_SIGNATURE),
+  };
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -76,6 +102,8 @@ const KILL_LOG_MESSAGES: Record<KillReason, string> = {
     'No guest output before first-output timeout — killing wedged VM',
   'startup-silence': 'No output for startup timeout — killing stuck container',
   'hard-timeout': 'Container timeout, stopping gracefully',
+  'max-lifetime':
+    'Absolute container lifetime exceeded — stopping runaway container',
 };
 
 export async function runContainerAgent(
@@ -199,7 +227,8 @@ export async function runContainerAgent(
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
-      lifecycle.onOutput(chunk.includes(GUEST_OUTPUT_SIGNATURE));
+      const { isGuest, isActivity } = classifyOutput(chunk);
+      lifecycle.onOutput(isGuest, isActivity);
 
       // Always accumulate for logging
       if (!stdoutTruncated) {
@@ -250,9 +279,10 @@ export async function runContainerAgent(
     container.stderr.on('data', (data) => {
       const chunk = data.toString();
       // SDK debug logs stream here continuously while the agent works —
-      // exactly the liveness signal the booting inactivity net needs. The
-      // hard deadline is unaffected (it only resets on result markers).
-      lifecycle.onOutput(chunk.includes(GUEST_OUTPUT_SIGNATURE));
+      // real activity that stretches the stall/idle deadlines. Heartbeat
+      // lines only prove liveness for the booting inactivity net.
+      const { isGuest, isActivity } = classifyOutput(chunk);
+      lifecycle.onOutput(isGuest, isActivity);
 
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
