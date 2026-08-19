@@ -390,6 +390,14 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Liveness heartbeat: the host kills a container that stays silent for
+  // CONTAINER_STARTUP_TIMEOUT before its first result marker. A long quiet
+  // tool call (big download, PDF processing) can exceed that even though the
+  // agent is healthy — emit a periodic log line so silence only ever means a
+  // genuinely dead guest.
+  const heartbeat = setInterval(() => log('heartbeat (query active)'), 60_000);
+
+  try {
   for await (const message of query({
     prompt: stream,
     options: {
@@ -468,7 +476,11 @@ async function runQuery(
     }
   }
 
-  ipcPolling = false;
+  } finally {
+    clearInterval(heartbeat);
+    ipcPolling = false;
+  }
+
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
