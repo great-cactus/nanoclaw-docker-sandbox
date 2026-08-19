@@ -252,6 +252,7 @@ export class TelegramChannel implements Channel {
         ctx.from?.id?.toString() ||
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const mediaThreadId = ctx.message.message_thread_id;
 
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
@@ -272,6 +273,7 @@ export class TelegramChannel implements Channel {
           content,
           timestamp,
           is_from_me: false,
+          thread_id: mediaThreadId ? mediaThreadId.toString() : undefined,
         });
       };
 

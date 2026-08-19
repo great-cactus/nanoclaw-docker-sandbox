@@ -191,6 +191,10 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
+  // Determine the thread_id from the most recent message for reply routing.
+  // In Telegram forum groups, responses should go to the same topic thread.
+  const replyThreadId = missedMessages[missedMessages.length - 1]?.thread_id;
+
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -202,7 +206,11 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    {
+      group: group.name,
+      messageCount: missedMessages.length,
+      threadId: replyThreadId,
+    },
     'Processing messages',
   );
 
@@ -228,7 +236,7 @@ async function processGroupMessages(chatJid: string): Promise<ProcessOutcome> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(chatJid, text);
+          await channel.sendMessage(chatJid, text, replyThreadId);
           outputSentToUser = true;
         }
       }
