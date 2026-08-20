@@ -116,6 +116,9 @@ export function buildVolumeMounts(
             // Enable Claude's memory feature (persists user preferences between sessions)
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+            // Default 32000 aborts long single responses (big derivations,
+            // large file writes) with an API error mid-task
+            CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000',
           },
         },
         null,
